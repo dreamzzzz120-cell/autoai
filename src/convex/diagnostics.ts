@@ -1,41 +1,464 @@
 import { v } from "convex/values";
-import { mutation, query, internalMutation } from "./_generated/server";
-import { getCurrentUser } from "./users";
+import { action, internalMutation, query } from "./_generated/server";
+import { internal } from "./_generated/api";
+import { z } from "zod";
 import { UNIVERSAL_DIAGNOSTIC_SYSTEM_PROMPT } from "./diagnosticEngine";
+import { buildDiagnosticGate, classifyDiagnosticRisk } from "./diagnosticGuardrails";
 
 const MAX_CONTENT_LENGTH = 10_000;
 const MAX_ATTACHMENTS = 5;
 const MAX_AUDIO_SIZE_BYTES = 25 * 1024 * 1024;
 const MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024;
-const RATE_LIMIT_WINDOWS: [number, number][] = [[30, 8], [60, 15], [3600, 60]];
-const RATE_LIMIT_MAX_AGE_SEC = 3600;
 const UPLOAD_CLAIM_TTL_MS = 10 * 60 * 1000;
-const OPENAI_TIMEOUT_MS = 30_000;
+const OPENAI_TIMEOUT_MS = 45_000;
 const MAX_AI_RESPONSE_BYTES = 120_000;
-const ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/webp", "image/gif"];
-const ALLOWED_AUDIO_TYPES = ["audio/webm", "audio/mpeg", "audio/mp4", "audio/wav", "audio/ogg", "audio/flac", "audio/x-m4a"];
+const RATE_LIMIT_WINDOWS: [number, number][] = [[30, 8], [60, 15], [3600, 60]];
+const ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/webp"] as const;
+const ALLOWED_AUDIO_TYPES = ["audio/webm", "audio/mpeg", "audio/mp4", "audio/wav", "audio/ogg", "audio/flac", "audio/x-m4a"] as const;
 const UPLOAD_TYPE_MAP: Record<string, "image" | "audio"> = {};
 for (const type of ALLOWED_IMAGE_TYPES) UPLOAD_TYPE_MAP[type] = "image";
 for (const type of ALLOWED_AUDIO_TYPES) UPLOAD_TYPE_MAP[type] = "audio";
 
 type EvidenceLevelType = "verified_fact" | "strong_evidence" | "professional_inference" | "unknown";
-interface DiagnosticResponse { content: string; evidence: { level: EvidenceLevelType; sources: { type: string; reference: string }[]; confidence: number; missingEvidence: string[]; alternativeExplanations: string[]; nextStep: string; safetyFlags: string[] } }
-function sanitizeText(text: string): string { return String(text || "").replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, "").replace(/<style[\s\S]*?>[\s\S]*?<\/style>/gi, "").replace(/<[^>]*>/g, "").replace(/javascript\s*:/gi, "").replace(/on\w+\s*=/gi, "").trim(); }
-function clamp(value: number, min: number, max: number) { return Math.min(Math.max(Number.isFinite(value) ? value : min, min), max); }
-function makeInternalClaimId(): string { return `${crypto.randomUUID()}-${crypto.randomUUID()}`; }
-function base64FromBytes(bytes: Uint8Array): string { let result = ""; const chunk = 0x8000; for (let i = 0; i < bytes.length; i += chunk) result += String.fromCharCode(...bytes.subarray(i, Math.min(i + chunk, bytes.length))); return btoa(result); }
-function sanitizeDiagnosis(raw: DiagnosticResponse, aiGenerated = true): DiagnosticResponse { const requestedLevel = raw?.evidence?.level; const level: EvidenceLevelType = aiGenerated ? (requestedLevel === "verified_fact" || requestedLevel === "strong_evidence" || requestedLevel === "professional_inference" ? "professional_inference" : "unknown") : (requestedLevel === "verified_fact" || requestedLevel === "strong_evidence" || requestedLevel === "professional_inference" || requestedLevel === "unknown" ? requestedLevel : "unknown"); const sources = (raw?.evidence?.sources || []).slice(0, 10).map((source) => ({ type: sanitizeText(source.type || "").slice(0, 50), reference: sanitizeText(source.reference || "").slice(0, 300) })); const normalized: DiagnosticResponse = { content: sanitizeText(raw?.content || "").slice(0, 6000), evidence: { level, sources: aiGenerated ? sources.map((s) => ({ ...s, reference: `[UNVERIFIED AI CLAIM] ${s.reference}`.slice(0, 300) })) : sources, confidence: 0, missingEvidence: (raw?.evidence?.missingEvidence || []).slice(0, 12).map((x) => sanitizeText(x).slice(0, 300)), alternativeExplanations: (raw?.evidence?.alternativeExplanations || []).slice(0, 10).map((x) => sanitizeText(x).slice(0, 300)), nextStep: sanitizeText(raw?.evidence?.nextStep || "Obtain additional evidence before concluding.").slice(0, 800), safetyFlags: (raw?.evidence?.safetyFlags || []).slice(0, 10).map((x) => sanitizeText(x).slice(0, 300)) } }; const levelBase: Record<EvidenceLevelType, number> = { verified_fact: 82, strong_evidence: 68, professional_inference: 48, unknown: 20 }; const missing = Math.min(normalized.evidence.missingEvidence.length, 8); const safetyPenalty = Math.min(normalized.evidence.safetyFlags.length * 2, 8); normalized.evidence.confidence = clamp(Math.round(levelBase[level] - missing * 3 - safetyPenalty), 5, aiGenerated ? 74 : 70); if (aiGenerated && normalized.evidence.missingEvidence.length === 0) normalized.evidence.missingEvidence.push("Independent source or direct measurement required before increasing confidence."); return normalized; }
-async function auditLog(ctx: { db: any }, userId: string, action: "session_create" | "session_delete" | "message_send", targetId: string, metadata?: Record<string, unknown>) { await ctx.db.insert("auditLogs", { userId, action, targetId, metadata: metadata ? JSON.stringify(metadata).slice(0, 4000) : undefined, timestamp: Date.now() }); }
-async function checkRateLimit(ctx: any, userId: string) { const now = Math.floor(Date.now() / 1000); for (const [seconds, max] of RATE_LIMIT_WINDOWS) { const bucket = `${seconds}s:${Math.floor(now / seconds) * seconds}`; const existing = await ctx.db.query("rateLimits").withIndex("by_user_window", (q: any) => q.eq("userId", userId).eq("window", bucket)).first(); if (existing) { if (existing.count >= max) throw new Error("Rate limit exceeded. Please wait before sending another diagnostic message."); await ctx.db.patch(existing._id, { count: existing.count + 1 }); } else await ctx.db.insert("rateLimits", { userId, window: bucket, count: 1 }); } }
-export const listSessions = query({ args: {}, handler: async (ctx) => { const user = await getCurrentUser(ctx); if (!user) return []; return await ctx.db.query("diagnosticSessions").withIndex("by_user", (q) => q.eq("userId", user._id)).order("desc").collect(); }});
-export const getSession = query({ args: { sessionId: v.id("diagnosticSessions") }, handler: async (ctx, args) => { const user = await getCurrentUser(ctx); if (!user) return null; const session = await ctx.db.get(args.sessionId); if (!session || session.userId !== user._id) return null; const messages = await ctx.db.query("diagnosticMessages").withIndex("by_session", (q) => q.eq("sessionId", args.sessionId)).order("asc").collect(); const safeMessages = await Promise.all(messages.map(async (message) => ({ ...message, attachments: message.attachments ? await Promise.all(message.attachments.map(async (attachment) => attachment.storageId ? { ...attachment, storageId: await ctx.storage.getUrl(attachment.storageId) || attachment.storageId } : attachment)) : message.attachments }))); return { ...session, messages: safeMessages }; }});
-export const createSession = mutation({ args: { title: v.string(), vehicleInfo: v.optional(v.object({ make: v.optional(v.string()), model: v.optional(v.string()), year: v.optional(v.number()), vin: v.optional(v.string()) })) }, handler: async (ctx, args) => { const user = await getCurrentUser(ctx); if (!user) throw new Error("Not authenticated"); const title = sanitizeText(args.title).slice(0, 200); if (!title) throw new Error("Session title is required"); const info = args.vehicleInfo ? { make: args.vehicleInfo.make ? sanitizeText(args.vehicleInfo.make).slice(0, 80) : undefined, model: args.vehicleInfo.model ? sanitizeText(args.vehicleInfo.model).slice(0, 80) : undefined, year: args.vehicleInfo.year ? clamp(args.vehicleInfo.year, 1886, 2100) : undefined, vin: args.vehicleInfo.vin ? sanitizeText(args.vehicleInfo.vin).slice(0, 17).toUpperCase() : undefined } : undefined; const now = Date.now(); const id = await ctx.db.insert("diagnosticSessions", { userId: user._id, title, vehicleInfo: info, status: "active", createdAt: now, updatedAt: now }); await auditLog(ctx, user._id, "session_create", id, { title }); return id; }});
-export const deleteSession = mutation({ args: { sessionId: v.id("diagnosticSessions") }, handler: async (ctx, args) => { const user = await getCurrentUser(ctx); if (!user) throw new Error("Not authenticated"); const session = await ctx.db.get(args.sessionId); if (!session || session.userId !== user._id) throw new Error("Not found"); const messages = await ctx.db.query("diagnosticMessages").withIndex("by_session", (q) => q.eq("sessionId", args.sessionId)).collect(); for (const message of messages) for (const attachment of message.attachments || []) if (attachment.storageId) await ctx.storage.delete(attachment.storageId); for (const message of messages) await ctx.db.delete(message._id); await ctx.db.delete(args.sessionId); await auditLog(ctx, user._id, "session_delete", args.sessionId, { messageCount: messages.length }); }});
-export const generateUploadUrl = mutation({ args: { contentType: v.string(), fileName: v.string() }, handler: async (ctx, args) => { const user = await getCurrentUser(ctx); if (!user) throw new Error("Not authenticated"); const type = args.contentType.toLowerCase().trim(); const kind = UPLOAD_TYPE_MAP[type]; if (!kind) throw new Error("Unsupported upload type"); const fileName = sanitizeText(args.fileName).trim().slice(0, 255); if (!fileName) throw new Error("Invalid filename"); const now = Date.now(); await ctx.db.insert("uploadClaims", { userId: user._id, tokenHash: makeInternalClaimId(), contentType: type, fileName, createdAt: now, expiresAt: now + UPLOAD_CLAIM_TTL_MS }); return { uploadUrl: await ctx.storage.generateUploadUrl(), kind }; }});
-async function validateUploadClaim(ctx: any, userId: string, storageId: string, fileName: string, expectedKind: "image" | "audio") { const claims = await ctx.db.query("uploadClaims").withIndex("by_user", (q: any) => q.eq("userId", userId)).order("desc").collect(); const candidates = claims.filter((claim: any) => !claim.claimedAt && claim.expiresAt >= Date.now() && claim.fileName === fileName && UPLOAD_TYPE_MAP[claim.contentType] === expectedKind); if (candidates.length !== 1) throw new Error(candidates.length === 0 ? "Invalid or expired upload claim" : "Ambiguous upload claim; please retry the upload"); const claim = candidates[0]; const url = await ctx.storage.getUrl(storageId); if (!url) throw new Error("Attachment not found"); await ctx.db.patch(claim._id, { storageId, claimedAt: Date.now() }); }
-async function transcribeAudio(apiKey: string, buffer: ArrayBuffer, fileName: string): Promise<string> { if (buffer.byteLength > MAX_AUDIO_SIZE_BYTES) return ""; const ext = fileName.split(".").pop()?.toLowerCase() || "webm"; const mime: Record<string, string> = { webm: "audio/webm", mp3: "audio/mpeg", mp4: "audio/mp4", m4a: "audio/mp4", wav: "audio/wav", ogg: "audio/ogg", flac: "audio/flac" }; const form = new FormData(); form.append("file", new Blob([buffer], { type: mime[ext] || "audio/webm" }), fileName); form.append("model", "whisper-1"); form.append("response_format", "json"); form.append("prompt", "automotive mechanical sound vocabulary: knock, tick, tap, rattle, squeal, grind, hum, bearing, belt, exhaust, misfire, chain"); const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS); try { const response = await fetch("https://api.openai.com/v1/audio/transcriptions", { method: "POST", headers: { Authorization: `Bearer ${apiKey}` }, body: form, signal: controller.signal }); if (!response.ok) return ""; const text = await response.text(); if (text.length > 50_000) return ""; const data = JSON.parse(text); return sanitizeText(data.text || "").slice(0, 2500); } catch { return ""; } finally { clearTimeout(timeout); } }
-function fallbackDiagnosis(message: string, machineHint = ""): DiagnosticResponse { const text = `${machineHint} ${message}`.toLowerCase(); const safety: string[] = []; if (/brake|no brake|can't stop|cannot stop/.test(text)) safety.push("Possible brake-system failure: do not operate until inspected."); if (/steer|steering|wheel.*loose/.test(text)) safety.push("Possible steering/control fault: do not operate until inspected."); if (/fuel leak|gasoline leak|diesel leak|fuel smell/.test(text)) safety.push("Possible fuel leak/fire hazard: shut down, isolate ignition sources, and have it inspected."); if (/overheat|overheating|temperature.*red|boil/.test(text)) safety.push("Possible overheating: stop operation and allow the system to cool safely."); if (/high voltage|hv battery|traction battery|orange cable/.test(text)) safety.push("High-voltage system risk: do not expose energized conductors or bypass interlocks."); if (/propeller|boat|pwc|jet ski/.test(text)) safety.push("Marine/propulsion hazard: shut down and isolate propulsion before hands-on inspection."); if (/hydraulic|hydraulics/.test(text)) safety.push("High-pressure hydraulic hazard: depressurize using the manufacturer's safe procedure before hands-on work."); let content = "I do not have enough verified evidence to identify a failed component. I can build a differential diagnosis, but the next step should be a safe, discriminating test rather than parts replacement."; const alternatives = ["Electrical/control fault", "Mechanical failure", "Fluid/fuel/air delivery problem", "Sensor or actuator fault"]; if (/p0\d{4}/i.test(text)) content = "A diagnostic trouble code is evidence that a control system detected a condition; it is not proof that the named component failed. Identify the exact machine and retrieve freeze-frame/live data before condemning a part."; if (/knock|tick|tap|rattle|grind|hum|squeal/.test(text)) content = "The described noise has multiple possible sources. Correlate it with RPM, load, temperature, location, and operating speed, then use a safe inspection/listening/test procedure to isolate the source."; return { content, evidence: { level: "unknown", sources: [], confidence: 15, missingEvidence: ["Machine type", "Year/make/model or manufacturer and model", "Exact symptom and operating conditions", "Objective measurements or diagnostic codes"], alternativeExplanations: alternatives, nextStep: "Provide the machine identity and the most specific measurable evidence available. I will then select the highest-information safe test.", safetyFlags: safety } }; }
-async function callOpenAI(apiKey: string, userMessage: string, history: { role: string; content: string }[], images: { data: string; mimeType: string }[], audioNames: string[], transcripts: string[]) { const userContent: any[] = [{ type: "text", text: userMessage }]; if (audioNames.length) userContent.push({ type: "text", text: `Uploaded audio: ${audioNames.join(", ")}. Transcripts (not waveform analysis): ${transcripts.join(" | ") || "none"}` }); for (const image of images) userContent.push({ type: "image_url", image_url: { url: `data:${image.mimeType};base64,${image.data}`, detail: "auto" } }); const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS); try { const response = await fetch("https://api.openai.com/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` }, body: JSON.stringify({ model: "gpt-4o-mini", temperature: 0.1, max_tokens: 1800, response_format: { type: "json_object" }, messages: [{ role: "system", content: UNIVERSAL_DIAGNOSTIC_SYSTEM_PROMPT }, ...history.map((h) => ({ role: h.role as "user" | "assistant", content: h.content })), { role: "user", content: userContent }] }), signal: controller.signal }); if (!response.ok) throw new Error("AI service unavailable"); const text = await response.text(); if (text.length > MAX_AI_RESPONSE_BYTES) throw new Error("AI response too large"); const data = JSON.parse(text); const raw = data.choices?.[0]?.message?.content; if (!raw || typeof raw !== "string" || raw.length > 50_000) throw new Error("Invalid AI response"); return JSON.parse(raw) as DiagnosticResponse; } finally { clearTimeout(timeout); } }
-export const sendMessage = mutation({ args: { sessionId: v.id("diagnosticSessions"), content: v.string(), attachments: v.optional(v.array(v.object({ type: v.union(v.literal("image"), v.literal("audio")), name: v.string(), storageId: v.optional(v.string()) }))) }, handler: async (ctx, args) => { const user = await getCurrentUser(ctx); if (!user) throw new Error("Not authenticated"); const session = await ctx.db.get(args.sessionId); if (!session || session.userId !== user._id) throw new Error("Session not found"); await checkRateLimit(ctx, user._id); const content = sanitizeText(args.content).slice(0, MAX_CONTENT_LENGTH); const attachments = (args.attachments || []).slice(0, MAX_ATTACHMENTS).map((a) => ({ ...a, name: sanitizeText(a.name).slice(0, 255) })); if (!content && attachments.length === 0) throw new Error("Message cannot be empty"); for (const a of attachments) if (a.storageId) await validateUploadClaim(ctx, user._id, a.storageId, a.name, a.type); const now = Date.now(); await ctx.db.insert("diagnosticMessages", { sessionId: args.sessionId, role: "user", content, attachments, createdAt: now }); const history = await ctx.db.query("diagnosticMessages").withIndex("by_session", (q) => q.eq("sessionId", args.sessionId)).order("asc").collect(); const apiKey = process.env.OPENAI_API_KEY; const transcripts: string[] = []; const audioNames: string[] = []; const images: { data: string; mimeType: string }[] = []; if (apiKey) for (const a of attachments) { if (!a.storageId) continue; try { const url = await ctx.storage.getUrl(a.storageId); if (!url) continue; if (a.type === "audio") { audioNames.push(a.name); const r = await fetch(url); const length = Number(r.headers.get("content-length") || "0"); if (!r.ok || length > MAX_AUDIO_SIZE_BYTES) continue; const transcript = await transcribeAudio(apiKey, await r.arrayBuffer(), a.name); if (transcript) transcripts.push(transcript); } else { const r = await fetch(url); const length = Number(r.headers.get("content-length") || "0"); if (!r.ok || length > MAX_IMAGE_SIZE_BYTES) continue; const buf = await r.arrayBuffer(); if (buf.byteLength > MAX_IMAGE_SIZE_BYTES) continue; const mimeType = (r.headers.get("content-type") || "").toLowerCase(); if (!ALLOWED_IMAGE_TYPES.includes(mimeType)) continue; images.push({ data: base64FromBytes(new Uint8Array(buf)), mimeType }); } } catch {} } let diagnosis: DiagnosticResponse; if (apiKey) { try { diagnosis = sanitizeDiagnosis(await callOpenAI(apiKey, content, history.filter((m) => m.role === "user" || m.role === "assistant").map((m) => ({ role: m.role, content: m.content })), images, audioNames, transcripts), true); } catch (error) { console.error("AI diagnostic provider failed; using conservative fallback", error); diagnosis = sanitizeDiagnosis(fallbackDiagnosis(content, `${session.vehicleInfo?.year || ""} ${session.vehicleInfo?.make || ""} ${session.vehicleInfo?.model || ""}`), false); } } else diagnosis = sanitizeDiagnosis(fallbackDiagnosis(content, `${session.vehicleInfo?.year || ""} ${session.vehicleInfo?.make || ""} ${session.vehicleInfo?.model || ""}`), false); await ctx.db.insert("diagnosticMessages", { sessionId: args.sessionId, role: "assistant", content: diagnosis.content, evidence: { level: diagnosis.evidence.level, sources: diagnosis.evidence.sources, confidence: diagnosis.evidence.confidence, missingEvidence: diagnosis.evidence.missingEvidence, alternativeExplanations: diagnosis.evidence.alternativeExplanations, nextStep: diagnosis.evidence.nextStep, safetyFlags: diagnosis.evidence.safetyFlags }, createdAt: now + 1 }); await ctx.db.patch(args.sessionId, { updatedAt: now, confidenceSummary: diagnosis.evidence.confidence }); await auditLog(ctx, user._id, "message_send", args.sessionId, { contentLength: content.length, attachmentCount: attachments.length, confidence: diagnosis.evidence.confidence, evidenceLevel: diagnosis.evidence.level }); return { confidence: diagnosis.evidence.confidence }; }});
-export const cleanupRateLimits = internalMutation({ args: {}, handler: async (ctx) => { const cutoff = Math.floor(Date.now() / 1000) - RATE_LIMIT_MAX_AGE_SEC; const rows = await ctx.db.query("rateLimits").collect(); let deleted = 0; for (const row of rows) { const idx = row.window.lastIndexOf(":"); const timestamp = idx >= 0 ? Number(row.window.slice(idx + 1)) : NaN; if (!Number.isFinite(timestamp) || timestamp < cutoff) { await ctx.db.delete(row._id); deleted++; } } return { deleted }; }});
-export const cleanupUploadClaims = internalMutation({ args: {}, handler: async (ctx) => { const rows = await ctx.db.query("uploadClaims").collect(); let deleted = 0; for (const row of rows) if (row.expiresAt < Date.now() || row.claimedAt) { await ctx.db.delete(row._id); deleted++; } return { deleted }; }});
+
+type Attachment = { type: "image" | "audio"; name: string; storageId?: string; transcript?: string };
+
+const DiagnosticResponseSchema = z.object({
+  content: z.string().min(1).max(6000),
+  evidence: z.object({
+    level: z.enum(["verified_fact", "strong_evidence", "professional_inference", "unknown"]),
+    sources: z.array(z.object({ type: z.string().max(50), reference: z.string().max(300) })).max(10).default([]),
+    confidence: z.number().min(0).max(100).optional(),
+    missingEvidence: z.array(z.string().max(300)).max(12).default([]),
+    alternativeExplanations: z.array(z.string().max(300)).max(10).default([]),
+    nextStep: z.string().max(800).default("Obtain additional evidence before concluding."),
+    safetyFlags: z.array(z.string().max(300)).max(10).default([]),
+  }),
+});
+
+type DiagnosticResponse = z.infer<typeof DiagnosticResponseSchema>;
+
+function sanitizeText(text: string): string {
+  return String(text || "")
+    .replace(/<script[\\s\\S]*?>[\\s\\S]*?<\\/script>/gi, "")
+    .replace(/<style[\\s\\S]*?>[\\s\\S]*?<\\/style>/gi, "")
+    .replace(/<[^>]*>/g, "")
+    .replace(/javascript\\s*:/gi, "")
+    .trim();
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(Math.max(Number.isFinite(value) ? value : min, min), max);
+}
+
+function normalizeDiagnosis(raw: unknown, inputText: string, machineIdentified: boolean, hasDirectEvidence: boolean): DiagnosticResponse {
+  const parsed = DiagnosticResponseSchema.safeParse(raw);
+  const base = parsed.success ? parsed.data : fallbackDiagnosis(inputText);
+  const clean: DiagnosticResponse = {
+    content: sanitizeText(base.content).slice(0, 6000),
+    evidence: {
+      level: base.evidence.level,
+      sources: base.evidence.sources.slice(0, 10).map((s) => ({ type: sanitizeText(s.type).slice(0, 50), reference: `[UNVERIFIED AI CLAIM] ${sanitizeText(s.reference).slice(0, 280)}` })),
+      confidence: 0,
+      missingEvidence: base.evidence.missingEvidence.slice(0, 12).map((x) => sanitizeText(x).slice(0, 300)),
+      alternativeExplanations: base.evidence.alternativeExplanations.slice(0, 10).map((x) => sanitizeText(x).slice(0, 300)),
+      nextStep: sanitizeText(base.evidence.nextStep).slice(0, 800),
+      safetyFlags: base.evidence.safetyFlags.slice(0, 10).map((x) => sanitizeText(x).slice(0, 300)),
+    },
+  };
+
+  // AI can never manufacture verified evidence. Directly supplied/retrieved evidence
+  // is promoted only by server-side code, never by the model.
+  if (clean.evidence.level === "verified_fact" || clean.evidence.level === "strong_evidence") {
+    clean.evidence.level = "professional_inference";
+  }
+
+  const gate = buildDiagnosticGate({
+    text: `${inputText} ${clean.content} ${clean.evidence.safetyFlags.join(" ")}`,
+    machineIdentified,
+    hasDirectEvidence,
+  });
+
+  if (gate.requiresMachineIdentity && !clean.evidence.missingEvidence.some((x) => /machine|vehicle|make|model|identity/i.test(x))) {
+    clean.evidence.missingEvidence.unshift("Exact machine identity (year/make/model or manufacturer/model)");
+  }
+  if (gate.requiresDirectEvidence && !clean.evidence.missingEvidence.some((x) => /measurement|evidence|test|code|inspection/i.test(x))) {
+    clean.evidence.missingEvidence.unshift("Direct evidence or an objective measurement");
+  }
+  if (gate.requiresDiscriminatingTest && !clean.evidence.nextStep) {
+    clean.evidence.nextStep = "Perform a safe discriminating test before replacing a component.";
+  }
+  if (gate.prohibitsPartsReplacementClaim && /replace|replacement|install|condemn|bad component|failed component/i.test(clean.content)) {
+    clean.content = `${clean.content} Do not replace or condemn a component from this evidence alone; verify it with the recommended test.`;
+  }
+  if (gate.risk === "stop_work" && clean.evidence.safetyFlags.length === 0) {
+    clean.evidence.safetyFlags.push("STOP WORK: isolate the machine and follow the manufacturer's safe procedure before further hands-on diagnosis.");
+  }
+  if (gate.risk === "safety_critical" && clean.evidence.safetyFlags.length === 0) {
+    clean.evidence.safetyFlags.push("Safety-critical condition detected: do not operate until the relevant system is safely inspected.");
+  }
+
+  const levelBase: Record<EvidenceLevelType, number> = { verified_fact: 82, strong_evidence: 68, professional_inference: 48, unknown: 20 };
+  const missingPenalty = Math.min(clean.evidence.missingEvidence.length, 8) * 4;
+  const safetyPenalty = Math.min(clean.evidence.safetyFlags.length, 4) * 4;
+  const gatePenalty = gate.requiresMachineIdentity || gate.requiresDirectEvidence ? 8 : 0;
+  clean.evidence.confidence = clamp(Math.round(levelBase[clean.evidence.level] - missingPenalty - safetyPenalty - gatePenalty), 5, 74);
+
+  if (!clean.evidence.missingEvidence.length) {
+    clean.evidence.missingEvidence.push("Independent measurement or authoritative service evidence required before a high-confidence repair decision.");
+  }
+  return clean;
+}
+
+function fallbackDiagnosis(message: string): DiagnosticResponse {
+  const text = message.toLowerCase();
+  const safety: string[] = [];
+  if (/brake|no brake|can't stop|cannot stop/.test(text)) safety.push("Possible brake-system failure: do not operate until inspected.");
+  if (/steer|steering|wheel.*loose|lug/.test(text)) safety.push("Possible steering/wheel-control fault: do not operate until inspected.");
+  if (/fuel leak|gasoline leak|diesel leak|fuel smell|smoke|fire/.test(text)) safety.push("Possible fire/fuel hazard: shut down safely and isolate ignition sources.");
+  if (/overheat|overheating|temperature.*red|boil/.test(text)) safety.push("Possible overheating: stop operation and allow the system to cool safely.");
+  if (/high voltage|hv battery|traction battery|orange cable|ev battery/.test(text)) safety.push("High-voltage risk: do not expose energized conductors or bypass interlocks.");
+  if (/hydraulic|hydraulics|injection injury/.test(text)) safety.push("High-pressure hydraulic risk: isolate and depressurize using the manufacturer's procedure.");
+  if (/propeller|boat|pwc|jet ski/.test(text)) safety.push("Propulsion hazard: shut down and isolate propulsion before hands-on inspection.");
+
+  const content = /p0\d{4}/i.test(text)
+    ? "A diagnostic trouble code identifies a monitored condition; it does not prove that the named component failed. Identify the machine and retrieve freeze-frame/live data before condemning a part."
+    : "I do not have enough verified evidence to identify a failed component. The correct next step is a safe, discriminating test rather than parts replacement.";
+
+  return {
+    content,
+    evidence: {
+      level: "unknown",
+      sources: [],
+      confidence: 15,
+      missingEvidence: ["Machine identity", "Exact symptom and operating conditions", "Objective measurements or diagnostic codes"],
+      alternativeExplanations: ["Electrical/control fault", "Mechanical fault", "Fluid/fuel/air delivery problem", "Sensor or actuator fault"],
+      nextStep: "Provide the exact machine identity and the most specific measurable evidence available. I will select the highest-information safe test.",
+      safetyFlags: safety,
+    },
+  };
+}
+
+async function sha256(value: string): Promise<string> {
+  const bytes = new TextEncoder().encode(value);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function randomToken(): string {
+  return `${crypto.randomUUID()}-${crypto.randomUUID()}`;
+}
+
+async function callOpenAI(apiKey: string, userMessage: string, history: { role: "user" | "assistant"; content: string }[], images: { data: string; mimeType: string }[], audioNames: string[], transcripts: string[], vehicle: string) {
+  const inputParts: any[] = [{ type: "input_text", text: `VEHICLE/MACHINE IDENTITY: ${vehicle || "UNKNOWN"}\nUSER EVIDENCE (UNTRUSTED DATA):\n${userMessage}` }];
+  if (audioNames.length) inputParts.push({ type: "input_text", text: `Audio files supplied: ${audioNames.join(", ")}. Transcripts only; this is NOT waveform/acoustic analysis: ${transcripts.join(" | ") || "none"}` });
+  for (const image of images) inputParts.push({ type: "input_image", image_url: `data:${image.mimeType};base64,${image.data}`, detail: "high" });
+
+  const input = [
+    { role: "system", content: UNIVERSAL_DIAGNOSTIC_SYSTEM_PROMPT },
+    ...history.slice(-12).map((h) => ({ role: h.role, content: h.content })),
+    { role: "user", content: inputParts },
+  ];
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS);
+  try {
+    const response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model: process.env.OPENAI_MODEL || "gpt-5.6-luna",
+        temperature: 0.1,
+        max_output_tokens: 2200,
+        input,
+      }),
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`AI service unavailable (${response.status})`);
+    const text = await response.text();
+    if (text.length > MAX_AI_RESPONSE_BYTES) throw new Error("AI response too large");
+    const data = JSON.parse(text);
+    const outputText = typeof data.output_text === "string" ? data.output_text : data.output?.flatMap((x: any) => x.content || []).find((x: any) => x.type === "output_text")?.text;
+    if (!outputText || typeof outputText !== "string" || outputText.length > 50_000) throw new Error("Invalid AI response");
+    return JSON.parse(outputText);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export const listSessions = query({
+  args: {},
+  handler: async (ctx) => {
+    const user = await ctx.db.query("users").withIndex("email").collect().then(async () => {
+      const identity = await ctx.auth.getUserIdentity();
+      if (!identity) return null;
+      const userId = identity.subject;
+      const byId = await ctx.db.get(userId as any);
+      return byId && byId.isAnonymous !== true ? byId : null;
+    });
+    if (!user) return [];
+    return ctx.db.query("diagnosticSessions").withIndex("by_user", (q) => q.eq("userId", user._id)).order("desc").collect();
+  },
+});
+
+export const getSession = query({
+  args: { sessionId: v.id("diagnosticSessions") },
+  handler: async (ctx, args) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) return null;
+    const user = await ctx.db.get(identity.subject as any);
+    if (!user || user.isAnonymous === true) return null;
+    const session = await ctx.db.get(args.sessionId);
+    if (!session || session.userId !== user._id) return null;
+    const messages = await ctx.db.query("diagnosticMessages").withIndex("by_session", (q) => q.eq("sessionId", args.sessionId)).order("asc").collect();
+    const safeMessages = await Promise.all(messages.map(async (message) => ({
+      ...message,
+      attachments: message.attachments ? await Promise.all(message.attachments.map(async (attachment) => attachment.storageId ? { ...attachment, storageId: await ctx.storage.getUrl(attachment.storageId) || undefined } : attachment)) : message.attachments,
+    })));
+    return { ...session, messages: safeMessages };
+  },
+});
+
+export const createSession = action({
+  args: { title: v.string(), vehicleInfo: v.optional(v.object({ make: v.optional(v.string()), model: v.optional(v.string()), year: v.optional(v.number()), vin: v.optional(v.string()) })) },
+  handler: async (ctx, args) => {
+    const user = await ctx.runQuery(internal.users.getCurrentUserInternal, {});
+    if (!user) throw new Error("Authentication required. Guest access is disabled.");
+    const title = sanitizeText(args.title).slice(0, 200);
+    if (!title) throw new Error("Session title is required");
+    return ctx.runMutation(internal.diagnostics.createSessionInternal, {
+      userId: user._id,
+      title,
+      vehicleInfo: args.vehicleInfo ? { make: args.vehicleInfo.make ? sanitizeText(args.vehicleInfo.make).slice(0, 80) : undefined, model: args.vehicleInfo.model ? sanitizeText(args.vehicleInfo.model).slice(0, 80) : undefined, year: args.vehicleInfo.year ? clamp(args.vehicleInfo.year, 1886, 2100) : undefined, vin: args.vehicleInfo.vin ? sanitizeText(args.vehicleInfo.vin).slice(0, 17).toUpperCase() : undefined },
+    });
+  },
+});
+
+export const deleteSession = action({
+  args: { sessionId: v.id("diagnosticSessions") },
+  handler: async (ctx, args) => {
+    const user = await ctx.runQuery(internal.users.getCurrentUserInternal, {});
+    if (!user) throw new Error("Authentication required. Guest access is disabled.");
+    return ctx.runMutation(internal.diagnostics.deleteSessionInternal, { userId: user._id, sessionId: args.sessionId });
+  },
+});
+
+export const generateUploadUrl = action({
+  args: { contentType: v.string(), fileName: v.string() },
+  handler: async (ctx, args) => {
+    const user = await ctx.runQuery(internal.users.getCurrentUserInternal, {});
+    if (!user) throw new Error("Authentication required. Guest access is disabled.");
+    const contentType = args.contentType.toLowerCase().trim();
+    const kind = UPLOAD_TYPE_MAP[contentType];
+    if (!kind) throw new Error("Unsupported upload type");
+    const fileName = sanitizeText(args.fileName).trim().slice(0, 255);
+    if (!fileName) throw new Error("Invalid filename");
+    const token = randomToken();
+    const tokenHash = await sha256(token);
+    const uploadUrl = await ctx.storage.generateUploadUrl();
+    await ctx.runMutation(internal.diagnostics.createUploadClaimInternal, { userId: user._id, tokenHash, contentType, fileName });
+    return { uploadUrl, kind, token };
+  },
+});
+
+export const sendMessage = action({
+  args: {
+    sessionId: v.id("diagnosticSessions"),
+    content: v.string(),
+    attachments: v.optional(v.array(v.object({ type: v.union(v.literal("image"), v.literal("audio")), name: v.string(), storageId: v.string(), claimToken: v.string() }))),
+  },
+  handler: async (ctx, args) => {
+    const user = await ctx.runQuery(internal.users.getCurrentUserInternal, {});
+    if (!user) throw new Error("Authentication required. Guest access is disabled.");
+    const content = sanitizeText(args.content).slice(0, MAX_CONTENT_LENGTH);
+    if (!content && !args.attachments?.length) throw new Error("Message cannot be empty");
+    if ((args.attachments?.length || 0) > MAX_ATTACHMENTS) throw new Error("Too many attachments");
+
+    const prepared = await ctx.runMutation(internal.diagnostics.prepareMessageInternal, {
+      userId: user._id,
+      sessionId: args.sessionId,
+      content: content || "[Media attachment]",
+      attachments: args.attachments || [],
+    });
+
+    const images: { data: string; mimeType: string }[] = [];
+    const audioNames: string[] = [];
+    const transcripts: string[] = [];
+    for (const attachment of prepared.attachments) {
+      const url = await ctx.storage.getUrl(attachment.storageId);
+      if (!url) continue;
+      const response = await fetch(url);
+      if (!response.ok) continue;
+      const buffer = await response.arrayBuffer();
+      if (attachment.type === "image") {
+        if (buffer.byteLength <= MAX_IMAGE_SIZE_BYTES) images.push({ data: Buffer.from(buffer).toString("base64"), mimeType: attachment.contentType });
+      } else {
+        audioNames.push(attachment.name);
+        if (buffer.byteLength <= MAX_AUDIO_SIZE_BYTES) {
+          const transcript = await transcribeAudio(process.env.OPENAI_API_KEY || "", buffer, attachment.name);
+          if (transcript) transcripts.push(transcript);
+          await ctx.runMutation(internal.diagnostics.saveTranscriptInternal, { userId: user._id, messageId: prepared.messageId, storageId: attachment.storageId, transcript });
+        }
+      }
+    }
+
+    let diagnosis: DiagnosticResponse;
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      diagnosis = fallbackDiagnosis(content);
+    } else {
+      try {
+        const raw = await callOpenAI(apiKey, content, prepared.history, images, audioNames, transcripts, prepared.vehicleIdentity);
+        diagnosis = normalizeDiagnosis(raw, content, Boolean(prepared.vehicleIdentity), images.length > 0 || transcripts.length > 0 || /\bP[0-3][0-9A-F]{4}\b/i.test(content));
+      } catch {
+        diagnosis = fallbackDiagnosis(content);
+      }
+    }
+
+    return ctx.runMutation(internal.diagnostics.saveAssistantMessageInternal, {
+      userId: user._id,
+      sessionId: args.sessionId,
+      content: diagnosis.content,
+      evidence: diagnosis.evidence,
+    });
+  },
+});
+
+async function transcribeAudio(apiKey: string, buffer: ArrayBuffer, fileName: string): Promise<string> {
+  if (!apiKey || buffer.byteLength > MAX_AUDIO_SIZE_BYTES) return "";
+  const ext = fileName.split(".").pop()?.toLowerCase() || "webm";
+  const mime: Record<string, string> = { webm: "audio/webm", mp3: "audio/mpeg", mp4: "audio/mp4", m4a: "audio/mp4", wav: "audio/wav", ogg: "audio/ogg", flac: "audio/flac" };
+  const form = new FormData();
+  form.append("file", new Blob([buffer], { type: mime[ext] || "audio/webm" }), fileName);
+  form.append("model", process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe");
+  form.append("response_format", "json");
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS);
+  try {
+    const response = await fetch("https://api.openai.com/v1/audio/transcriptions", { method: "POST", headers: { Authorization: `Bearer ${apiKey}` }, body: form, signal: controller.signal });
+    if (!response.ok) return "";
+    const text = await response.text();
+    if (text.length > 50_000) return "";
+    const data = JSON.parse(text);
+    return sanitizeText(data.text || "").slice(0, 2500);
+  } catch {
+    return "";
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export const createSessionInternal = internalMutation({
+  args: { userId: v.id("users"), title: v.string(), vehicleInfo: v.optional(v.object({ make: v.optional(v.string()), model: v.optional(v.string()), year: v.optional(v.number()), vin: v.optional(v.string()) })) },
+  handler: async (ctx, args) => {
+    const user = await ctx.db.get(args.userId);
+    if (!user || user.isAnonymous === true) throw new Error("Invalid authenticated user");
+    const now = Date.now();
+    const id = await ctx.db.insert("diagnosticSessions", { userId: args.userId, title: args.title, vehicleInfo: args.vehicleInfo, status: "active", createdAt: now, updatedAt: now });
+    await ctx.db.insert("auditLogs", { userId: args.userId, action: "session_create", targetId: id, metadata: JSON.stringify({ title: args.title }).slice(0, 4000), timestamp: now });
+    return id;
+  },
+});
+
+export const deleteSessionInternal = internalMutation({
+  args: { userId: v.id("users"), sessionId: v.id("diagnosticSessions") },
+  handler: async (ctx, args) => {
+    const session = await ctx.db.get(args.sessionId);
+    if (!session || session.userId !== args.userId) throw new Error("Not found");
+    const messages = await ctx.db.query("diagnosticMessages").withIndex("by_session", (q) => q.eq("sessionId", args.sessionId)).collect();
+    for (const message of messages) {
+      for (const attachment of message.attachments || []) if (attachment.storageId) await ctx.storage.delete(attachment.storageId);
+      await ctx.db.delete(message._id);
+    }
+    const claims = await ctx.db.query("uploadClaims").withIndex("by_user", (q) => q.eq("userId", args.userId)).collect();
+    for (const claim of claims.filter((c) => c.storageId && c.claimedAt)) await ctx.db.delete(claim._id);
+    await ctx.db.delete(args.sessionId);
+    await ctx.db.insert("auditLogs", { userId: args.userId, action: "session_delete", targetId: args.sessionId, metadata: JSON.stringify({ messageCount: messages.length }).slice(0, 4000), timestamp: Date.now() });
+  },
+});
+
+export const createUploadClaimInternal = internalMutation({
+  args: { userId: v.id("users"), tokenHash: v.string(), contentType: v.string(), fileName: v.string() },
+  handler: async (ctx, args) => {
+    const user = await ctx.db.get(args.userId);
+    if (!user || user.isAnonymous === true) throw new Error("Invalid authenticated user");
+    await ctx.db.insert("uploadClaims", { userId: args.userId, tokenHash: args.tokenHash, contentType: args.contentType, fileName: args.fileName, createdAt: Date.now(), expiresAt: Date.now() + UPLOAD_CLAIM_TTL_MS });
+  },
+});
+
+export const prepareMessageInternal = internalMutation({
+  args: { userId: v.id("users"), sessionId: v.id("diagnosticSessions"), content: v.string(), attachments: v.array(v.object({ type: v.union(v.literal("image"), v.literal("audio")), name: v.string(), storageId: v.string(), claimToken: v.string() })) },
+  handler: async (ctx, args) => {
+    const session = await ctx.db.get(args.sessionId);
+    if (!session || session.userId !== args.userId) throw new Error("Not found");
+    const historyDocs = await ctx.db.query("diagnosticMessages").withIndex("by_session", (q) => q.eq("sessionId", args.sessionId)).order("desc").take(12);
+    const preparedAttachments: { type: "image" | "audio"; name: string; storageId: string; contentType: string }[] = [];
+    for (const attachment of args.attachments) {
+      const tokenHash = await sha256(attachment.claimToken);
+      const claims = await ctx.db.query("uploadClaims").withIndex("by_token", (q) => q.eq("tokenHash", tokenHash)).collect();
+      const claim = claims.find((c) => c.userId === args.userId && !c.claimedAt && c.expiresAt >= Date.now() && c.fileName === attachment.name && UPLOAD_TYPE_MAP[c.contentType] === attachment.type);
+      if (!claim) throw new Error("Invalid, expired, or already-used upload claim");
+      const url = await ctx.storage.getUrl(attachment.storageId);
+      if (!url) throw new Error("Attachment not found");
+      await ctx.db.patch(claim._id, { storageId: attachment.storageId, claimedAt: Date.now() });
+      preparedAttachments.push({ type: attachment.type, name: attachment.name, storageId: attachment.storageId, contentType: claim.contentType });
+    }
+    const messageId = await ctx.db.insert("diagnosticMessages", { sessionId: args.sessionId, role: "user", content: args.content, attachments: args.attachments.map((a) => ({ type: a.type, name: a.name, storageId: a.storageId })), createdAt: Date.now() });
+    const history = historyDocs.reverse().map((m) => ({ role: m.role === "assistant" ? "assistant" as const : "user" as const, content: m.content }));
+    const vehicle = session.vehicleInfo ? [session.vehicleInfo.year, session.vehicleInfo.make, session.vehicleInfo.model, session.vehicleInfo.vin].filter(Boolean).join(" ") : "";
+    return { messageId, attachments: preparedAttachments, history, vehicleIdentity: vehicle };
+  },
+});
+
+export const saveTranscriptInternal = internalMutation({
+  args: { userId: v.id("users"), messageId: v.id("diagnosticMessages"), storageId: v.string(), transcript: v.string() },
+  handler: async (ctx, args) => {
+    const message = await ctx.db.get(args.messageId);
+    if (!message) return;
+    const session = await ctx.db.get(message.sessionId);
+    if (!session || session.userId !== args.userId) return;
+    const attachments = (message.attachments || []).map((a) => a.storageId === args.storageId ? { ...a, transcript: args.transcript.slice(0, 2500) } : a);
+    await ctx.db.patch(message._id, { attachments });
+  },
+});
+
+export const saveAssistantMessageInternal = internalMutation({
+  args: { userId: v.id("users"), sessionId: v.id("diagnosticSessions"), content: v.string(), evidence: v.object({ level: v.union(v.literal("verified_fact"), v.literal("strong_evidence"), v.literal("professional_inference"), v.literal("unknown")), sources: v.array(v.object({ type: v.string(), reference: v.string() })), confidence: v.number(), missingEvidence: v.array(v.string()), alternativeExplanations: v.array(v.string()), nextStep: v.string(), safetyFlags: v.array(v.string()) }) },
+  handler: async (ctx, args) => {
+    const session = await ctx.db.get(args.sessionId);
+    if (!session || session.userId !== args.userId) throw new Error("Not found");
+    const now = Date.now();
+    const messageId = await ctx.db.insert("diagnosticMessages", { sessionId: args.sessionId, role: "assistant", content: args.content, evidence: args.evidence, createdAt: now });
+    await ctx.db.patch(args.sessionId, { updatedAt: now, confidenceSummary: args.evidence.confidence });
+    await ctx.db.insert("auditLogs", { userId: args.userId, action: "message_send", targetId: messageId, metadata: JSON.stringify({ sessionId: args.sessionId, confidence: args.evidence.confidence, risk: classifyDiagnosticRisk(`${args.content} ${args.evidence.safetyFlags.join(" ")}`) }).slice(0, 4000), timestamp: now });
+    return messageId;
+  },
+});
+
+export const cleanupRateLimits = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    const cutoff = Math.floor(Date.now() / 1000) - 3600;
+    const rows = await ctx.db.query("rateLimits").collect();
+    for (const row of rows) {
+      const match = row.window.match(/^(?:30|60|3600)s:(\\d+)$/);
+      if (match && Number(match[1]) < cutoff) await ctx.db.delete(row._id);
+    }
+  },
+});
+
+export const cleanupUploadClaims = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    const now = Date.now();
+    const claims = await ctx.db.query("uploadClaims").collect();
+    for (const claim of claims) {
+      if (claim.expiresAt < now) {
+        if (claim.storageId && !claim.claimedAt) {
+          try { await ctx.storage.delete(claim.storageId); } catch { /* already deleted */ }
+        }
+        await ctx.db.delete(claim._id);
+      }
+    }
+  },
+});
