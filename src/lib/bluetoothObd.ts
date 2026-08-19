@@ -95,8 +95,8 @@ function decodeSupportedPids(line: string): number[] {
 function decodeVin(line: string): string | null {
   if (!/(?:49\s+02|4A\s+02)/i.test(line)) return null;
   const bytes = (line.match(/\b[0-9A-F]{2}\b/gi) || []).map((x) => parseInt(x, 16));
-  const ascii = bytes.filter((b) => b >= 0x21 && b <= 0x7e).map((b) => String.fromCharCode(b)).join("").replace(/^.*?02/, "");
-  const vin = ascii.replace(/[^A-Z0-9]/gi, "").toUpperCase();
+  const chars = bytes.filter((b) => b >= 0x21 && b <= 0x7e).map((b) => String.fromCharCode(b)).join("");
+  const vin = chars.replace(/[^A-Z0-9]/gi, "").toUpperCase();
   return vin.length >= 11 && vin.length <= 17 ? vin.slice(-17) : null;
 }
 
@@ -147,7 +147,6 @@ export class BluetoothObdConnection {
   }
 
   onReading(handler: (reading: BluetoothObdReading) => void) { this.handlers.add(handler); return () => this.handlers.delete(handler); }
-
   private emit() { const snapshot = { ...this.current, dtcs: this.current.dtcs ? [...this.current.dtcs] : undefined, supportedPids: this.current.supportedPids ? [...this.current.supportedPids] : undefined }; for (const handler of this.handlers) handler(snapshot); }
 
   private onValue = (event: Event) => {
@@ -158,34 +157,32 @@ export class BluetoothObdConnection {
     for (const line of lines.slice(-32)) {
       const normalized = line.trim().slice(0, MAX_LINE_LENGTH); if (!normalized) continue;
       const supported = decodeSupportedPids(normalized); if (supported.length) this.current.supportedPids = [...new Set([...(this.current.supportedPids || []), ...supported])].slice(0, 128);
-      decodePidLine(normalized, this.current);
+      const decoded = decodeObdLine(normalized); if (decoded) decodePidLine(normalized, this.current);
       const dtcs = decodeDtcResponse(normalized); if (dtcs.length) this.current.dtcs = dtcs;
       const vin = decodeVin(normalized); if (vin) this.current.vin = vin;
-      if (decodeObdLine(normalized) || dtcs.length || supported.length || vin) { this.current.observedAt = Date.now(); this.emit(); }
+      if (decoded || dtcs.length || supported.length || vin) { this.current.observedAt = Date.now(); this.emit(); }
     }
   };
 
   private async rawSend(command: string) {
     if (this.closed || !this.writeCharacteristic) throw new Error("Bluetooth OBD adapter is not connected.");
+    if (!/^[A-Z0-9]+$/.test(command)) throw new Error("Invalid diagnostic command.");
     const now = Date.now(); const delay = Math.max(0, MIN_COMMAND_GAP_MS - (now - this.lastCommandAt)); if (delay) await new Promise((r) => setTimeout(r, delay));
     await this.writeCharacteristic.writeValue(new TextEncoder().encode(`${command}\r`)); this.lastCommandAt = Date.now();
   }
 
   private async send(command: string, timeoutMs = COMMAND_TIMEOUT_MS) {
     const task = this.commandChain.then(async () => {
-      await this.rawSend(command);
-      await new Promise<void>((resolve) => setTimeout(resolve, Math.min(timeoutMs, 250)));
+      const work = this.rawSend(command);
+      await Promise.race([work, new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`Bluetooth command timed out: ${command}`)), timeoutMs))]);
+      await new Promise((resolve) => setTimeout(resolve, 120));
     });
     this.commandChain = task.catch(() => undefined);
     return task;
   }
 
   async readSupportedPids() { await this.send("0100"); await this.send("0120"); await this.send("0140"); }
-  async readLiveData() {
-    const supported = new Set(this.current.supportedPids || []);
-    if (!supported.size) await this.readSupportedPids();
-    for (const pid of SUPPORTED_STANDARD_PIDS) if (supported.size === 0 || supported.has(parseInt(pid, 16))) await this.send(`01${pid}`);
-  }
+  async readLiveData() { const supported = new Set(this.current.supportedPids || []); if (!supported.size) await this.readSupportedPids(); const refreshed = new Set(this.current.supportedPids || []); for (const pid of SUPPORTED_STANDARD_PIDS) if (!refreshed.size || refreshed.has(parseInt(pid, 16))) await this.send(`01${pid}`); }
   async readVin() { await this.send("0902"); }
   async readDtcs() { await this.send("03"); }
   getSnapshot() { return { ...this.current, dtcs: this.current.dtcs ? [...this.current.dtcs] : undefined, supportedPids: this.current.supportedPids ? [...this.current.supportedPids] : undefined }; }
