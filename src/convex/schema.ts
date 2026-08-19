@@ -19,13 +19,12 @@ const schema = defineSchema({
   diagnosticMessages: defineTable({
     sessionId: v.id("diagnosticSessions"), role: v.union(v.literal("user"), v.literal("assistant"), v.literal("system")), content: v.string(),
     evidence: v.optional(v.object({ level: evidenceLevels, sources: v.array(v.object({ type: v.string(), reference: v.string(), url: v.optional(v.string()) })), confidence: v.optional(v.number()), missingEvidence: v.optional(v.array(v.string())), alternativeExplanations: v.optional(v.array(v.string())), nextStep: v.optional(v.string()), safetyFlags: v.optional(v.array(v.string())) })),
-    // Bearer upload tokens are mutation-only and must never be persisted.
     attachments: v.optional(v.array(v.object({ type: v.union(v.literal("image"), v.literal("audio")), name: v.string(), storageId: v.optional(v.string()), transcript: v.optional(v.string()) }))),
     createdAt: v.number(),
   }).index("by_session", ["sessionId"]),
   rateLimits: defineTable({ userId: v.id("users"), window: v.string(), count: v.number() }).index("by_user_window", ["userId", "window"]),
   auditLogs: defineTable({ userId: v.id("users"), action: v.union(v.literal("session_create"), v.literal("session_delete"), v.literal("message_send")), targetId: v.string(), metadata: v.optional(v.string()), timestamp: v.number() }).index("by_user", ["userId"]).index("by_action", ["action"]),
-  uploadClaims: defineTable({ userId: v.id("users"), tokenHash: v.string(), storageId: v.optional(v.string()), contentType: v.string(), fileName: v.string(), createdAt: v.number(), expiresAt: v.number(), claimedAt: v.optional(v.number()) }).index("by_token", ["tokenHash"]).index("by_user", ["userId"]),
+  uploadClaims: defineTable({ userId: v.id("users"), tokenHash: v.string(), storageId: v.optional(v.string()), contentType: v.string(), fileName: v.string(), createdAt: v.number(), expiresAt: v.number(), claimedAt: v.optional(v.number()) }).index("by_token", ["tokenHash"]).index("by_user", ["userId"]).index("by_user_storage", ["userId", "storageId"]),
 }, { schemaValidation: true });
 
 export default schema;
