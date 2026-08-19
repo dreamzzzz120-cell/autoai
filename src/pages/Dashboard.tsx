@@ -4,6 +4,7 @@ import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
+import { DeviceConnector } from "@/components/DeviceConnector";
 import { useAuth } from "@/hooks/use-auth";
 import { api } from "@/convex/_generated/api";
 import type { Id } from "@/convex/_generated/dataModel";
@@ -58,7 +59,7 @@ function Chat({ session, onSend, sending }: { session: any; onSend: (content: st
   const submit = async (e: React.FormEvent) => { e.preventDefault(); if (sending || (!text.trim() && !files.length)) return; const f = files; setFiles([]); const t = text.trim(); setText(""); try { await onSend(t || "[Media attachment]", f); } catch { setText(t); setFiles(f); } };
   return <div className="flex-1 flex flex-col min-w-0">
     <div className="border-b border-border/40 px-5 py-3 flex items-center gap-3"><Car className="size-4 text-primary" /><div className="min-w-0"><h2 className="font-semibold text-sm truncate">{session.title}</h2><p className="text-[11px] text-muted-foreground truncate">{session.vehicleInfo ? [session.vehicleInfo.year, session.vehicleInfo.make, session.vehicleInfo.model].filter(Boolean).join(" ") : "Machine identity not yet supplied"}</p></div>{session.confidenceSummary != null && <Badge variant="secondary" className="ml-auto">{session.confidenceSummary}%</Badge>}</div>
-    <ScrollArea className="flex-1 px-4 py-5"><div className="max-w-4xl mx-auto">{session.messages?.length === 0 && <div className="py-16 text-center"><ShieldCheck className="size-10 text-primary/40 mx-auto mb-3" /><h3 className="font-semibold">Evidence-first diagnosis</h3><p className="text-sm text-muted-foreground max-w-md mx-auto mt-2">Start with the exact vehicle or machine identity, symptoms, operating conditions, codes, and measurements. MechanicAI will prioritize the safest test that separates the likely causes.</p></div>}{session.messages?.map((m: any) => <Message key={m._id} message={m} />)}{sending && <div className="flex items-center gap-2 text-sm text-muted-foreground mb-4"><Loader2 className="size-4 animate-spin text-primary" />Analyzing evidence and applying safety gates…</div>}<div ref={endRef} /></div></ScrollArea>
+    <ScrollArea className="flex-1 px-4 py-5"><div className="max-w-4xl mx-auto"><DeviceConnector onEvidence={async (evidence) => { setText((prev) => prev ? `${prev}\n\n${evidence}` : evidence); }} />{session.messages?.length === 0 && <div className="py-16 text-center"><ShieldCheck className="size-10 text-primary/40 mx-auto mb-3" /><h3 className="font-semibold">Evidence-first diagnosis</h3><p className="text-sm text-muted-foreground max-w-md mx-auto mt-2">Start with the exact vehicle or machine identity, symptoms, operating conditions, codes, and measurements. MechanicAI will prioritize the safest test that separates the likely causes.</p></div>}{session.messages?.map((m: any) => <Message key={m._id} message={m} />)}{sending && <div className="flex items-center gap-2 text-sm text-muted-foreground mb-4"><Loader2 className="size-4 animate-spin text-primary" />Analyzing evidence and applying safety gates…</div>}<div ref={endRef} /></div></ScrollArea>
     <div className="border-t border-border/40 p-4"><form onSubmit={submit} className="max-w-4xl mx-auto"><div className="flex gap-2 items-center glass rounded-2xl p-2"><input ref={imageRef} hidden type="file" accept="image/jpeg,image/png,image/webp" multiple onChange={(e) => addFiles(e.target.files, "image")} /><input ref={audioRef} hidden type="file" accept="audio/*" multiple onChange={(e) => addFiles(e.target.files, "audio")} /><Button type="button" variant="ghost" size="icon" onClick={() => imageRef.current?.click()} disabled={sending}><Camera className="size-4" /></Button><Button type="button" variant="ghost" size="icon" onClick={() => audioRef.current?.click()} disabled={sending}><Mic className="size-4" /></Button><Input value={text} maxLength={MAX_CONTENT_LENGTH} onChange={(e) => setText(e.target.value)} placeholder="Symptoms, DTCs, measurements, or observations…" className="border-0 bg-transparent focus-visible:ring-0" disabled={sending} /><Button type="submit" size="icon" disabled={sending || (!text.trim() && !files.length)}>{sending ? <Loader2 className="size-4 animate-spin" /> : <Send className="size-4" />}</Button></div>{files.length > 0 && <div className="mt-2 flex flex-wrap gap-2">{files.map((f, i) => <Badge key={`${f.name}-${i}`} variant="outline" className="gap-1">{f.type.startsWith("audio") ? "🎙" : "📷"} {f.name}<button type="button" onClick={() => setFiles((p) => p.filter((_, j) => j !== i))}><X className="size-3" /></button></Badge>)}</div>}<p className="text-[10px] text-muted-foreground mt-2 text-center">Images are visually analyzed. Audio is transcribed; it is not acoustic waveform analysis.</p></form></div>
   </div>;
 }
@@ -84,14 +85,14 @@ export default function Dashboard() {
     if (!activeId) return;
     setSending(true);
     try {
-      const attachments: { type: "image" | "audio"; name: string; storageId: string; claimToken: string }[] = [];
+      const attachments: { type: "image" | "audio"; name: string; storageId: string; uploadToken: string }[] = [];
       for (const file of files) {
         const result = await upload({ contentType: file.type, fileName: file.name });
         const response = await fetch(result.uploadUrl, { method: "POST", headers: { "Content-Type": file.type }, body: file });
         if (!response.ok) throw new Error(`Upload failed (${response.status})`);
         const body = await response.json();
         if (!body.storageId) throw new Error("Upload did not return a storage ID");
-        attachments.push({ type: result.kind, name: file.name, storageId: body.storageId, claimToken: result.token });
+        attachments.push({ type: result.kind, name: file.name, storageId: body.storageId, uploadToken: result.uploadToken });
       }
       await sendMessage({ sessionId: activeId, content, attachments: attachments.length ? attachments : undefined });
     } finally { setSending(false); }
