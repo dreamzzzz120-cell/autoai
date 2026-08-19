@@ -1,21 +1,20 @@
 export type BluetoothObdReading = {
   rpm?: number;
   speedKph?: number;
+  engineLoadPct?: number;
   coolantC?: number;
   intakeAirC?: number;
   throttlePct?: number;
-  engineLoadPct?: number;
-  shortFuelTrimPct?: number;
-  longFuelTrimPct?: number;
+  shortFuelTrimBank1Pct?: number;
+  longFuelTrimBank1Pct?: number;
   mapKpa?: number;
   mafGps?: number;
   fuelLevelPct?: number;
   controlModuleVoltageV?: number;
-  ambientTempC?: number;
+  ambientAirC?: number;
   oilTempC?: number;
-  engineFuelRateLph?: number;
+  fuelRateLph?: number;
   dtcs?: string[];
-  vin?: string;
   observedAt: number;
 };
 
@@ -51,22 +50,23 @@ function decodePidLine(line: string, output: BluetoothObdReading) {
   const decoded = decodeObdLine(line);
   if (!decoded) return;
   const { pid, bytes } = decoded;
+  const a = bytes[0];
   switch (pid) {
-    case 0x04: if (bytes.length >= 1) output.engineLoadPct = (bytes[0] * 100) / 255; break;
-    case 0x05: if (bytes.length >= 1) output.coolantC = bytes[0] - 40; break;
-    case 0x06: if (bytes.length >= 1) output.shortFuelTrimPct = (bytes[0] - 128) * 100 / 128; break;
-    case 0x07: if (bytes.length >= 1) output.longFuelTrimPct = (bytes[0] - 128) * 100 / 128; break;
-    case 0x0B: if (bytes.length >= 1) output.mapKpa = bytes[0]; break;
+    case 0x04: if (a != null) output.engineLoadPct = (a * 100) / 255; break;
+    case 0x05: if (a != null) output.coolantC = a - 40; break;
+    case 0x06: if (a != null) output.shortFuelTrimBank1Pct = (a - 128) * 100 / 128; break;
+    case 0x07: if (a != null) output.longFuelTrimBank1Pct = (a - 128) * 100 / 128; break;
+    case 0x0B: if (a != null) output.mapKpa = a; break;
     case 0x0C: if (bytes.length >= 2) output.rpm = ((bytes[0] * 256) + bytes[1]) / 4; break;
-    case 0x0D: if (bytes.length >= 1) output.speedKph = bytes[0]; break;
-    case 0x0F: if (bytes.length >= 1) output.intakeAirC = bytes[0] - 40; break;
+    case 0x0D: if (a != null) output.speedKph = a; break;
+    case 0x0F: if (a != null) output.intakeAirC = a - 40; break;
     case 0x10: if (bytes.length >= 2) output.mafGps = ((bytes[0] * 256) + bytes[1]) / 100; break;
-    case 0x11: if (bytes.length >= 1) output.throttlePct = (bytes[0] * 100) / 255; break;
-    case 0x2F: if (bytes.length >= 1) output.fuelLevelPct = (bytes[0] * 100) / 255; break;
+    case 0x11: if (a != null) output.throttlePct = (a * 100) / 255; break;
+    case 0x2F: if (a != null) output.fuelLevelPct = (a * 100) / 255; break;
+    case 0x46: if (a != null) output.ambientAirC = a - 40; break;
+    case 0x5C: if (a != null) output.oilTempC = a - 40; break;
+    case 0x5E: if (bytes.length >= 2) output.fuelRateLph = ((bytes[0] * 256) + bytes[1]) / 20; break;
     case 0x42: if (bytes.length >= 2) output.controlModuleVoltageV = ((bytes[0] * 256) + bytes[1]) / 1000; break;
-    case 0x46: if (bytes.length >= 1) output.ambientTempC = bytes[0] - 40; break;
-    case 0x5C: if (bytes.length >= 1) output.oilTempC = bytes[0] - 40; break;
-    case 0x5E: if (bytes.length >= 2) output.engineFuelRateLph = ((bytes[0] * 256) + bytes[1]) / 20; break;
   }
 }
 
@@ -87,14 +87,6 @@ function decodeDtcResponse(line: string): string[] {
   return [...new Set(result)];
 }
 
-function decodeVinResponse(line: string): string | undefined {
-  const match = line.match(/(?:49|69)\s+02\s+([0-9A-Fa-f\s]+)/i);
-  if (!match) return undefined;
-  const bytes = parseHexPayload(match[1]);
-  const ascii = bytes.map((b) => String.fromCharCode(b)).join("").replace(/[^\x20-\x7E]/g, "").trim();
-  return /^[A-HJ-NPR-Z0-9]{11,17}$/.test(ascii) ? ascii : undefined;
-}
-
 export class BluetoothObdConnection {
   private device: BluetoothDevice | null = null;
   private writeCharacteristic: BluetoothRemoteGATTCharacteristic | null = null;
@@ -102,14 +94,13 @@ export class BluetoothObdConnection {
   private rxBuffer = "";
   private handlers = new Set<(reading: BluetoothObdReading) => void>();
   private current: BluetoothObdReading = { observedAt: 0 };
-  private monitorTimer: ReturnType<typeof setInterval> | null = null;
-  private pollInFlight = false;
 
   async connect() {
     assertBluetooth();
     this.device = await navigator.bluetooth.requestDevice({ filters: [{ services: SERVICE_CANDIDATES }], optionalServices: SERVICE_CANDIDATES });
     const server = await this.device.gatt?.connect();
     if (!server) throw new Error("Bluetooth GATT connection failed.");
+
     try {
       const service = await server.getPrimaryService(NUS_SERVICE);
       this.writeCharacteristic = await service.getCharacteristic(NUS_RX);
@@ -119,6 +110,7 @@ export class BluetoothObdConnection {
       this.writeCharacteristic = await service.getCharacteristic(HM10_CHAR);
       this.notifyCharacteristic = this.writeCharacteristic;
     }
+
     await this.notifyCharacteristic.startNotifications();
     this.notifyCharacteristic.addEventListener("characteristicvaluechanged", this.onValue);
     this.device.addEventListener("gattserverdisconnected", this.onDisconnected);
@@ -133,13 +125,11 @@ export class BluetoothObdConnection {
   }
 
   private onDisconnected = () => {
-    this.stopMonitoring();
     this.writeCharacteristic = null;
     this.notifyCharacteristic = null;
   };
 
   async disconnectDevice() {
-    this.stopMonitoring();
     if (this.notifyCharacteristic) {
       try { await this.notifyCharacteristic.stopNotifications(); } catch {}
       this.notifyCharacteristic.removeEventListener("characteristicvaluechanged", this.onValue);
@@ -167,8 +157,6 @@ export class BluetoothObdConnection {
       decodePidLine(normalized, this.current);
       const dtcs = decodeDtcResponse(normalized);
       if (dtcs.length) this.current.dtcs = dtcs;
-      const vin = decodeVinResponse(normalized);
-      if (vin) this.current.vin = vin;
       this.current.observedAt = Date.now();
       for (const handler of this.handlers) handler({ ...this.current });
     }
@@ -179,38 +167,20 @@ export class BluetoothObdConnection {
     await this.writeCharacteristic.writeValue(new TextEncoder().encode(`${command}\r`));
   }
 
-  async readLiveData() {
-    for (const command of ["0104", "0105", "0106", "0107", "010B", "010C", "010D", "010F", "0110", "0111", "012F", "0142", "0146", "015C", "015E"]) {
-      await this.send(command);
-      await new Promise((resolve) => setTimeout(resolve, 80));
-    }
+  async readSupportedPids(start: 0 | 0x20 | 0x40 = 0) {
+    await this.send(`01${start.toString(16).padStart(2, "0").toUpperCase()}`);
   }
 
-  async readDtcs() {
-    await this.send("03");
+  async readLiveData() {
+    for (const pid of ["04", "05", "06", "07", "0B", "0C", "0D", "0F", "10", "11", "2F", "42", "46", "5C", "5E"]) await this.send(`01${pid}`);
   }
 
   async readVin() {
     await this.send("0902");
   }
 
-  startMonitoring(intervalMs = 1500) {
-    if (this.monitorTimer) return;
-    this.monitorTimer = setInterval(async () => {
-      if (this.pollInFlight || !this.writeCharacteristic) return;
-      this.pollInFlight = true;
-      try {
-        await this.readLiveData();
-        await this.readDtcs();
-      } finally {
-        this.pollInFlight = false;
-      }
-    }, Math.max(750, intervalMs));
-  }
-
-  stopMonitoring() {
-    if (this.monitorTimer) clearInterval(this.monitorTimer);
-    this.monitorTimer = null;
+  async readDtcs() {
+    await this.send("03");
   }
 
   getSnapshot() {
