@@ -19,9 +19,8 @@ const schema = defineSchema({
   diagnosticMessages: defineTable({
     sessionId: v.id("diagnosticSessions"), role: v.union(v.literal("user"), v.literal("assistant"), v.literal("system")), content: v.string(),
     evidence: v.optional(v.object({ level: evidenceLevels, sources: v.array(v.object({ type: v.string(), reference: v.string(), url: v.optional(v.string()) })), confidence: v.optional(v.number()), missingEvidence: v.optional(v.array(v.string())), alternativeExplanations: v.optional(v.array(v.string())), nextStep: v.optional(v.string()), safetyFlags: v.optional(v.array(v.string())) })),
-    // uploadToken is accepted only on the mutation input and stripped before persistence;
-    // it is never stored with the message or exposed in diagnostic history.
-    attachments: v.optional(v.array(v.object({ type: v.union(v.literal("image"), v.literal("audio")), name: v.string(), storageId: v.optional(v.string()), transcript: v.optional(v.string()), uploadToken: v.optional(v.string()) }))),
+    // Bearer upload tokens are mutation-only and must never be persisted.
+    attachments: v.optional(v.array(v.object({ type: v.union(v.literal("image"), v.literal("audio")), name: v.string(), storageId: v.optional(v.string()), transcript: v.optional(v.string()) }))),
     createdAt: v.number(),
   }).index("by_session", ["sessionId"]),
   rateLimits: defineTable({ userId: v.id("users"), window: v.string(), count: v.number() }).index("by_user_window", ["userId", "window"]),
