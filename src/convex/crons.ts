@@ -3,11 +3,7 @@ import { internal } from "./_generated/api";
 
 const crons = cronJobs();
 
-// Clean up expired rate limit rows every 10 minutes
-crons.interval(
-  "cleanup-expired-rate-limits",
-  { minutes: 10 },
-  internal.diagnostics.cleanupRateLimits,
-);
+crons.interval("cleanup-expired-rate-limits", { minutes: 10 }, internal.diagnostics.cleanupRateLimits);
+crons.interval("cleanup-upload-claims", { minutes: 10 }, internal.diagnostics.cleanupUploadClaims);
 
 export default crons;
