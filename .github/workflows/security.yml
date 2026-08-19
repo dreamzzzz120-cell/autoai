@@ -29,6 +29,9 @@ jobs:
       - name: Dependency audit
         run: npm audit --audit-level=high
 
+      - name: Formatting check
+        run: npx prettier --check .
+
       - name: Lint
         run: npm run lint
 
