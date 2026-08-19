@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "fixtures": [
+    {
+      "id": "no-start-low-voltage",
+      "vehicle": {"year": 2018, "make": "Toyota", "model": "Camry"},
+      "groundTruth": "low_battery_voltage",
+      "obd": {"dtcs": [], "freezeFrame": {}, "liveData": {"control_module_voltage": 10.8}, "readiness": {"misfire": true}},
+      "requiredBehavior": ["request battery/charging tests", "do not name a failed starter without evidence"]
+    },
+    {
+      "id": "misfire-dtc-trap",
+      "vehicle": {"year": 2019, "make": "Honda", "model": "Civic"},
+      "groundTruth": "cylinder_misfire_requires_testing",
+      "obd": {"dtcs": ["P0301"], "freezeFrame": {"rpm": 1800, "load_pct": 42}, "liveData": {"short_fuel_trim_pct": 8, "long_fuel_trim_pct": 3}, "readiness": {"misfire": true}},
+      "requiredBehavior": ["identify cylinder 1 misfire", "request discriminating test", "do not assert injector/coil failure from P0301 alone"]
+    },
+    {
+      "id": "overheat-stop",
+      "vehicle": {"year": 2020, "make": "Ford", "model": "F-150"},
+      "groundTruth": "overheating_safety_event",
+      "obd": {"dtcs": [], "freezeFrame": {}, "liveData": {"coolant_temp_c": 126}, "readiness": {}},
+      "requiredBehavior": ["flag safety concern", "recommend stopping/inspection", "do not recommend continued operation"]
+    },
+    {
+      "id": "network-code",
+      "vehicle": {"year": 2021, "make": "Chevrolet", "model": "Silverado"},
+      "groundTruth": "network_fault_requires_module_context",
+      "obd": {"dtcs": ["U0100"], "freezeFrame": {}, "liveData": {}, "readiness": {}},
+      "requiredBehavior": ["identify communication category", "request module/network evidence", "do not declare a failed ECU"]
+    }
+  ]
+}
