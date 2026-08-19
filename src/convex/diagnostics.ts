@@ -9,6 +9,9 @@ const MAX_AUDIO_SIZE_BYTES = 25 * 1024 * 1024;
 const MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024;
 const RATE_LIMIT_WINDOWS: [number, number][] = [[30, 8], [60, 15], [3600, 60]];
 const RATE_LIMIT_MAX_AGE_SEC = 3600;
+const UPLOAD_CLAIM_TTL_MS = 10 * 60 * 1000;
+const OPENAI_TIMEOUT_MS = 30_000;
+const MAX_AI_RESPONSE_BYTES = 120_000;
 const ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/webp", "image/gif"];
 const ALLOWED_AUDIO_TYPES = ["audio/webm", "audio/mpeg", "audio/mp4", "audio/wav", "audio/ogg", "audio/flac", "audio/x-m4a"];
 const UPLOAD_TYPE_MAP: Record<string, "image" | "audio"> = {};
@@ -16,67 +19,37 @@ for (const type of ALLOWED_IMAGE_TYPES) UPLOAD_TYPE_MAP[type] = "image";
 for (const type of ALLOWED_AUDIO_TYPES) UPLOAD_TYPE_MAP[type] = "audio";
 
 type EvidenceLevelType = "verified_fact" | "strong_evidence" | "professional_inference" | "unknown";
-interface DiagnosticResponse {
-  content: string;
-  evidence: { level: EvidenceLevelType; sources: { type: string; reference: string }[]; confidence: number; missingEvidence: string[]; alternativeExplanations: string[]; nextStep: string; safetyFlags: string[] };
-}
+interface DiagnosticResponse { content: string; evidence: { level: EvidenceLevelType; sources: { type: string; reference: string }[]; confidence: number; missingEvidence: string[]; alternativeExplanations: string[]; nextStep: string; safetyFlags: string[] } }
 
-function sanitizeText(text: string): string {
-  return String(text || "").replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, "").replace(/<style[\s\S]*?>[\s\S]*?<\/style>/gi, "").replace(/<[^>]*>/g, "").replace(/javascript\s*:/gi, "").replace(/on\w+\s*=/gi, "").trim();
-}
+function sanitizeText(text: string): string { return String(text || "").replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, "").replace(/<style[\s\S]*?>[\s\S]*?<\/style>/gi, "").replace(/<[^>]*>/g, "").replace(/javascript\s*:/gi, "").replace(/on\w+\s*=/gi, "").trim(); }
+function clamp(value: number, min: number, max: number) { return Math.min(Math.max(Number.isFinite(value) ? value : min, min), max); }
+async function sha256(value: string): Promise<string> { const bytes = new TextEncoder().encode(value); const digest = await crypto.subtle.digest("SHA-256", bytes); return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join(""); }
+function makeToken(): string { return `${crypto.randomUUID()}-${crypto.randomUUID()}-${crypto.randomUUID()}`; }
+function base64FromBytes(bytes: Uint8Array): string { let result = ""; const chunk = 0x8000; for (let i = 0; i < bytes.length; i += chunk) result += String.fromCharCode(...bytes.subarray(i, Math.min(i + chunk, bytes.length))); return btoa(result); }
 
-function clamp(value: number, min: number, max: number) {
-  return Math.min(Math.max(Number.isFinite(value) ? value : min, min), max);
-}
-
-/**
- * AI output is NEVER allowed to promote itself to verified evidence.
- * Verified/strong evidence requires an independently recorded source or user-supplied
- * observation; this layer only receives untrusted model output.
- */
-function sanitizeDiagnosis(raw: DiagnosticResponse, suppliedEvidence = 0, aiGenerated = true): DiagnosticResponse {
+function sanitizeDiagnosis(raw: DiagnosticResponse, aiGenerated = true): DiagnosticResponse {
   const requestedLevel = raw?.evidence?.level;
-  const level: EvidenceLevelType = aiGenerated
-    ? (requestedLevel === "verified_fact" || requestedLevel === "strong_evidence" ? "professional_inference" : requestedLevel === "professional_inference" ? "professional_inference" : "unknown")
-    : (Object.values({ verified_fact: "verified_fact", strong_evidence: "strong_evidence", professional_inference: "professional_inference", unknown: "unknown" }) as string[]).includes(requestedLevel) ? requestedLevel : "unknown";
-
-  const sources = (raw?.evidence?.sources || []).slice(0, 10).map((source) => ({
-    type: sanitizeText(source.type || "").slice(0, 50),
-    reference: sanitizeText(source.reference || "").slice(0, 300),
-  }));
-  const normalized = {
-    content: sanitizeText(raw?.content || "").slice(0, 6000),
-    evidence: {
-      level,
-      // AI-created references are explicitly marked unverified in the stored reference.
-      sources: aiGenerated ? sources.map((s) => ({ ...s, reference: `[UNVERIFIED AI CLAIM] ${s.reference}`.slice(0, 300) })) : sources,
-      confidence: 0,
-      missingEvidence: (raw?.evidence?.missingEvidence || []).slice(0, 12).map((x) => sanitizeText(x).slice(0, 300)),
-      alternativeExplanations: (raw?.evidence?.alternativeExplanations || []).slice(0, 10).map((x) => sanitizeText(x).slice(0, 300)),
-      nextStep: sanitizeText(raw?.evidence?.nextStep || "Obtain additional evidence before concluding.").slice(0, 800),
-      safetyFlags: (raw?.evidence?.safetyFlags || []).slice(0, 10).map((x) => sanitizeText(x).slice(0, 300)),
-    },
-  };
-
+  const level: EvidenceLevelType = aiGenerated ? (requestedLevel === "verified_fact" || requestedLevel === "strong_evidence" || requestedLevel === "professional_inference" ? "professional_inference" : "unknown") : (requestedLevel === "verified_fact" || requestedLevel === "strong_evidence" || requestedLevel === "professional_inference" || requestedLevel === "unknown" ? requestedLevel : "unknown");
+  const sources = (raw?.evidence?.sources || []).slice(0, 10).map((source) => ({ type: sanitizeText(source.type || "").slice(0, 50), reference: sanitizeText(source.reference || "").slice(0, 300) }));
+  const normalized: DiagnosticResponse = { content: sanitizeText(raw?.content || "").slice(0, 6000), evidence: { level, sources: aiGenerated ? sources.map((s) => ({ ...s, reference: `[UNVERIFIED AI CLAIM] ${s.reference}`.slice(0, 300) })) : sources, confidence: 0, missingEvidence: (raw?.evidence?.missingEvidence || []).slice(0, 12).map((x) => sanitizeText(x).slice(0, 300)), alternativeExplanations: (raw?.evidence?.alternativeExplanations || []).slice(0, 10).map((x) => sanitizeText(x).slice(0, 300)), nextStep: sanitizeText(raw?.evidence?.nextStep || "Obtain additional evidence before concluding.").slice(0, 800), safetyFlags: (raw?.evidence?.safetyFlags || []).slice(0, 10).map((x) => sanitizeText(x).slice(0, 300)) } };
   const levelBase: Record<EvidenceLevelType, number> = { verified_fact: 82, strong_evidence: 68, professional_inference: 48, unknown: 20 };
   const missing = Math.min(normalized.evidence.missingEvidence.length, 8);
   const safetyPenalty = Math.min(normalized.evidence.safetyFlags.length * 2, 8);
-  // AI results are capped below a verified/high-confidence claim until provenance exists.
-  const evidenceBonus = Math.min(suppliedEvidence * 4, 16);
-  const rawConfidence = Math.round(levelBase[level] + evidenceBonus - missing * 3 - safetyPenalty);
-  normalized.evidence.confidence = clamp(rawConfidence, 5, aiGenerated ? 74 : 95);
-  if (aiGenerated && normalized.evidence.confidence >= 70 && normalized.evidence.missingEvidence.length === 0) {
-    normalized.evidence.missingEvidence.push("Independent source or direct measurement required before increasing confidence.");
-  }
+  // Input existence is not evidence. AI-generated provenance is never a confidence bonus.
+  const rawConfidence = Math.round(levelBase[level] - missing * 3 - safetyPenalty);
+  normalized.evidence.confidence = clamp(rawConfidence, 5, aiGenerated ? 74 : 70);
+  if (aiGenerated && normalized.evidence.missingEvidence.length === 0) normalized.evidence.missingEvidence.push("Independent source or direct measurement required before increasing confidence.");
   return normalized;
 }
 
 async function auditLog(ctx: { db: any }, userId: string, action: "session_create" | "session_delete" | "message_send", targetId: string, metadata?: Record<string, unknown>) {
-  try { await ctx.db.insert("auditLogs", { userId, action, targetId, metadata: metadata ? JSON.stringify(metadata).slice(0, 4000) : undefined, timestamp: Date.now() }); } catch { /* availability is preferred over audit failure */ }
+  // Security-critical mutations fail closed if the audit record cannot be written.
+  await ctx.db.insert("auditLogs", { userId, action, targetId, metadata: metadata ? JSON.stringify(metadata).slice(0, 4000) : undefined, timestamp: Date.now() });
 }
 
 async function checkRateLimit(ctx: any, userId: string) {
   const now = Math.floor(Date.now() / 1000);
+  // This runs inside one Convex mutation transaction, so the counter update commits atomically.
   for (const [seconds, max] of RATE_LIMIT_WINDOWS) {
     const bucket = `${seconds}s:${Math.floor(now / seconds) * seconds}`;
     const existing = await ctx.db.query("rateLimits").withIndex("by_user_window", (q: any) => q.eq("userId", userId).eq("window", bucket)).first();
@@ -86,7 +59,6 @@ async function checkRateLimit(ctx: any, userId: string) {
 }
 
 export const listSessions = query({ args: {}, handler: async (ctx) => { const user = await getCurrentUser(ctx); if (!user) return []; return await ctx.db.query("diagnosticSessions").withIndex("by_user", (q) => q.eq("userId", user._id)).order("desc").collect(); }});
-
 export const getSession = query({ args: { sessionId: v.id("diagnosticSessions") }, handler: async (ctx, args) => { const user = await getCurrentUser(ctx); if (!user) return null; const session = await ctx.db.get(args.sessionId); if (!session || session.userId !== user._id) return null; const messages = await ctx.db.query("diagnosticMessages").withIndex("by_session", (q) => q.eq("sessionId", args.sessionId)).order("asc").collect(); return { ...session, messages }; }});
 
 export const createSession = mutation({ args: { title: v.string(), vehicleInfo: v.optional(v.object({ make: v.optional(v.string()), model: v.optional(v.string()), year: v.optional(v.number()), vin: v.optional(v.string()) })) }, handler: async (ctx, args) => {
@@ -99,17 +71,35 @@ export const createSession = mutation({ args: { title: v.string(), vehicleInfo: 
 export const deleteSession = mutation({ args: { sessionId: v.id("diagnosticSessions") }, handler: async (ctx, args) => {
   const user = await getCurrentUser(ctx); if (!user) throw new Error("Not authenticated"); const session = await ctx.db.get(args.sessionId); if (!session || session.userId !== user._id) throw new Error("Not found");
   const messages = await ctx.db.query("diagnosticMessages").withIndex("by_session", (q) => q.eq("sessionId", args.sessionId)).collect();
-  for (const message of messages) for (const attachment of message.attachments || []) if (attachment.storageId) { try { await ctx.storage.delete(attachment.storageId); } catch {} }
+  for (const message of messages) for (const attachment of message.attachments || []) if (attachment.storageId) { await ctx.storage.delete(attachment.storageId); }
   for (const message of messages) await ctx.db.delete(message._id); await ctx.db.delete(args.sessionId); await auditLog(ctx, user._id, "session_delete", args.sessionId, { messageCount: messages.length });
 }});
 
 export const generateUploadUrl = mutation({ args: { contentType: v.string(), fileName: v.string() }, handler: async (ctx, args) => {
-  const user = await getCurrentUser(ctx); if (!user) throw new Error("Not authenticated"); const type = args.contentType.toLowerCase().trim(); if (!UPLOAD_TYPE_MAP[type]) throw new Error("Unsupported upload type"); if (!sanitizeText(args.fileName).trim()) throw new Error("Invalid filename"); return { uploadUrl: await ctx.storage.generateUploadUrl() };
+  const user = await getCurrentUser(ctx); if (!user) throw new Error("Not authenticated");
+  const type = args.contentType.toLowerCase().trim(); const kind = UPLOAD_TYPE_MAP[type]; if (!kind) throw new Error("Unsupported upload type");
+  const fileName = sanitizeText(args.fileName).trim().slice(0, 255); if (!fileName) throw new Error("Invalid filename");
+  const token = makeToken(); const tokenHash = await sha256(token); const now = Date.now();
+  await ctx.db.insert("uploadClaims", { userId: user._id, tokenHash, contentType: type, fileName, createdAt: now, expiresAt: now + UPLOAD_CLAIM_TTL_MS });
+  return { uploadUrl: await ctx.storage.generateUploadUrl(), uploadToken: token, kind };
 }});
 
+async function validateUploadClaim(ctx: any, userId: string, storageId: string, uploadToken: string, expectedKind: "image" | "audio") {
+  if (!uploadToken) throw new Error("Upload claim required");
+  const claim = await ctx.db.query("uploadClaims").withIndex("by_token", (q: any) => q.eq("tokenHash", await sha256(uploadToken))).first();
+  if (!claim || claim.userId !== userId || claim.expiresAt < Date.now() || claim.claimedAt) throw new Error("Invalid or expired upload claim");
+  if (UPLOAD_TYPE_MAP[claim.contentType] !== expectedKind) throw new Error("Attachment type mismatch");
+  if (claim.storageId && claim.storageId !== storageId) throw new Error("Upload already bound to another object");
+  const url = await ctx.storage.getUrl(storageId); if (!url) throw new Error("Attachment not found");
+  await ctx.db.patch(claim._id, { storageId, claimedAt: Date.now() });
+}
+
 async function transcribeAudio(apiKey: string, buffer: ArrayBuffer, fileName: string): Promise<string> {
-  if (buffer.byteLength > MAX_AUDIO_SIZE_BYTES) return ""; const ext = fileName.split(".").pop()?.toLowerCase() || "webm"; const mime: Record<string, string> = { webm: "audio/webm", mp3: "audio/mpeg", mp4: "audio/mp4", m4a: "audio/mp4", wav: "audio/wav", ogg: "audio/ogg", flac: "audio/flac" }; const form = new FormData(); form.append("file", new Blob([buffer], { type: mime[ext] || "audio/webm" }), fileName); form.append("model", "whisper-1"); form.append("response_format", "json"); form.append("prompt", "automotive mechanical sound vocabulary: knock, tick, tap, rattle, squeal, grind, hum, bearing, belt, exhaust, misfire, chain");
-  const response = await fetch("https://api.openai.com/v1/audio/transcriptions", { method: "POST", headers: { Authorization: `Bearer ${apiKey}` }, body: form }); if (!response.ok) return ""; const data = await response.json(); return sanitizeText(data.text || "").slice(0, 2500);
+  if (buffer.byteLength > MAX_AUDIO_SIZE_BYTES) return "";
+  const ext = fileName.split(".").pop()?.toLowerCase() || "webm"; const mime: Record<string, string> = { webm: "audio/webm", mp3: "audio/mpeg", mp4: "audio/mp4", m4a: "audio/mp4", wav: "audio/wav", ogg: "audio/ogg", flac: "audio/flac" };
+  const form = new FormData(); form.append("file", new Blob([buffer], { type: mime[ext] || "audio/webm" }), fileName); form.append("model", "whisper-1"); form.append("response_format", "json"); form.append("prompt", "automotive mechanical sound vocabulary: knock, tick, tap, rattle, squeal, grind, hum, bearing, belt, exhaust, misfire, chain");
+  const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS);
+  try { const response = await fetch("https://api.openai.com/v1/audio/transcriptions", { method: "POST", headers: { Authorization: `Bearer ${apiKey}` }, body: form, signal: controller.signal }); if (!response.ok) return ""; const text = await response.text(); if (text.length > 50_000) return ""; const data = JSON.parse(text); return sanitizeText(data.text || "").slice(0, 2500); } catch { return ""; } finally { clearTimeout(timeout); }
 }
 
 function fallbackDiagnosis(message: string, machineHint = ""): DiagnosticResponse {
@@ -129,23 +119,29 @@ function fallbackDiagnosis(message: string, machineHint = ""): DiagnosticRespons
 }
 
 async function callOpenAI(apiKey: string, userMessage: string, history: { role: string; content: string }[], images: { data: string; mimeType: string }[], audioNames: string[], transcripts: string[]) {
-  const userContent: any[] = [{ type: "text", text: userMessage }]; if (audioNames.length) userContent.push({ type: "text", text: `Uploaded audio: ${audioNames.join(", ")}. Transcripts (not waveform analysis): ${transcripts.join(" | ") || "none"}` }); for (const image of images) userContent.push({ type: "image_url", image_url: { url: `data:${image.mimeType};base64,${image.data}`, detail: "auto" } });
-  const response = await fetch("https://api.openai.com/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` }, body: JSON.stringify({ model: "gpt-4o-mini", temperature: 0.1, max_tokens: 1800, response_format: { type: "json_object" }, messages: [{ role: "system", content: UNIVERSAL_DIAGNOSTIC_SYSTEM_PROMPT }, ...history.map((h) => ({ role: h.role as "user" | "assistant", content: h.content })), { role: "user", content: userContent }] }) });
-  if (!response.ok) throw new Error("AI service unavailable"); const data = await response.json(); const raw = data.choices?.[0]?.message?.content; if (!raw) throw new Error("Empty AI response"); return JSON.parse(raw) as DiagnosticResponse;
+  const userContent: any[] = [{ type: "text", text: userMessage }];
+  if (audioNames.length) userContent.push({ type: "text", text: `Uploaded audio: ${audioNames.join(", ")}. Transcripts (not waveform analysis): ${transcripts.join(" | ") || "none"}` });
+  for (const image of images) userContent.push({ type: "image_url", image_url: { url: `data:${image.mimeType};base64,${image.data}`, detail: "auto" } });
+  const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS);
+  try {
+    const response = await fetch("https://api.openai.com/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` }, body: JSON.stringify({ model: "gpt-4o-mini", temperature: 0.1, max_tokens: 1800, response_format: { type: "json_object" }, messages: [{ role: "system", content: UNIVERSAL_DIAGNOSTIC_SYSTEM_PROMPT }, ...history.map((h) => ({ role: h.role as "user" | "assistant", content: h.content })), { role: "user", content: userContent }] }), signal: controller.signal });
+    if (!response.ok) throw new Error("AI service unavailable"); const text = await response.text(); if (text.length > MAX_AI_RESPONSE_BYTES) throw new Error("AI response too large"); const data = JSON.parse(text); const raw = data.choices?.[0]?.message?.content; if (!raw || typeof raw !== "string") throw new Error("Empty AI response"); if (raw.length > 50_000) throw new Error("AI diagnostic payload too large"); return JSON.parse(raw) as DiagnosticResponse;
+  } finally { clearTimeout(timeout); }
 }
 
-export const sendMessage = mutation({ args: { sessionId: v.id("diagnosticSessions"), content: v.string(), attachments: v.optional(v.array(v.object({ type: v.union(v.literal("image"), v.literal("audio"), v.literal("video"), v.literal("document")), name: v.string(), storageId: v.optional(v.string()) }))) }, handler: async (ctx, args) => {
+export const sendMessage = mutation({ args: { sessionId: v.id("diagnosticSessions"), content: v.string(), attachments: v.optional(v.array(v.object({ type: v.union(v.literal("image"), v.literal("audio")), name: v.string(), storageId: v.optional(v.string()), uploadToken: v.optional(v.string()) }))) }, handler: async (ctx, args) => {
   const user = await getCurrentUser(ctx); if (!user) throw new Error("Not authenticated"); const session = await ctx.db.get(args.sessionId); if (!session || session.userId !== user._id) throw new Error("Session not found"); await checkRateLimit(ctx, user._id);
   const content = sanitizeText(args.content).slice(0, MAX_CONTENT_LENGTH); const attachments = (args.attachments || []).slice(0, MAX_ATTACHMENTS).map((a) => ({ ...a, name: sanitizeText(a.name).slice(0, 255) })); if (!content && attachments.length === 0) throw new Error("Message cannot be empty");
-  for (const a of attachments) if (a.storageId && a.type === "image") { const url = await ctx.storage.getUrl(a.storageId); if (!url) throw new Error("Invalid image attachment"); }
+  for (const a of attachments) if (a.storageId) await validateUploadClaim(ctx, user._id, a.storageId, a.uploadToken || "", a.type);
   const now = Date.now(); const userMessageId = await ctx.db.insert("diagnosticMessages", { sessionId: args.sessionId, role: "user", content, attachments, createdAt: now });
-  const history = await ctx.db.query("diagnosticMessages").withIndex("by_session", (q) => q.eq("sessionId", args.sessionId)).order("asc").collect(); const apiKey = process.env.OPENAI_API_KEY; const transcripts: string[] = []; const audioNames: string[] = []; const images: { data: string; mimeType: string }[] = []; const effectiveAttachments: any[] = attachments.map((a) => ({ ...a }));
-  if (apiKey) for (let i = 0; i < effectiveAttachments.length; i++) { const a = effectiveAttachments[i]; if (!a.storageId) continue; try { const url = await ctx.storage.getUrl(a.storageId); if (!url) continue; if (a.type === "audio") { audioNames.push(a.name); const r = await fetch(url); if (r.ok) { const transcript = await transcribeAudio(apiKey, await r.arrayBuffer(), a.name); if (transcript) { transcripts.push(transcript); effectiveAttachments[i] = { ...a, transcript }; } } } else if (a.type === "image") { const r = await fetch(url); if (!r.ok) continue; const buf = await r.arrayBuffer(); if (buf.byteLength > MAX_IMAGE_SIZE_BYTES) continue; const base64 = btoa(String.fromCharCode(...new Uint8Array(buf))); images.push({ data: base64, mimeType: r.headers.get("content-type") || "image/jpeg" }); } } catch {} }
-  if (JSON.stringify(effectiveAttachments) !== JSON.stringify(attachments)) await ctx.db.patch(userMessageId, { attachments: effectiveAttachments });
+  const history = await ctx.db.query("diagnosticMessages").withIndex("by_session", (q) => q.eq("sessionId", args.sessionId)).order("asc").collect(); const apiKey = process.env.OPENAI_API_KEY; const transcripts: string[] = []; const audioNames: string[] = []; const images: { data: string; mimeType: string }[] = []; const effectiveAttachments: any[] = attachments.map((a) => ({ ...a, uploadToken: undefined }));
+  if (apiKey) for (let i = 0; i < attachments.length; i++) { const a = attachments[i]; if (!a.storageId) continue; try { const url = await ctx.storage.getUrl(a.storageId); if (!url) continue; if (a.type === "audio") { audioNames.push(a.name); const r = await fetch(url); const length = Number(r.headers.get("content-length") || "0"); if (!r.ok || length > MAX_AUDIO_SIZE_BYTES) continue; const transcript = await transcribeAudio(apiKey, await r.arrayBuffer(), a.name); if (transcript) { transcripts.push(transcript); effectiveAttachments[i] = { ...effectiveAttachments[i], transcript }; } } else if (a.type === "image") { const r = await fetch(url); const length = Number(r.headers.get("content-length") || "0"); if (!r.ok || length > MAX_IMAGE_SIZE_BYTES) continue; const buf = await r.arrayBuffer(); if (buf.byteLength > MAX_IMAGE_SIZE_BYTES) continue; const mimeType = r.headers.get("content-type") || ""; if (!ALLOWED_IMAGE_TYPES.includes(mimeType.toLowerCase())) continue; images.push({ data: base64FromBytes(new Uint8Array(buf)), mimeType }); } } catch {} }
+  if (JSON.stringify(effectiveAttachments) !== JSON.stringify(attachments.map((a) => ({ ...a, uploadToken: undefined })))) await ctx.db.patch(userMessageId, { attachments: effectiveAttachments });
   let diagnosis: DiagnosticResponse;
-  const evidenceCount = (session.vehicleInfo ? 1 : 0) + (content.match(/\bP\d{4}\b/gi)?.length || 0) + images.length + transcripts.length;
-  if (apiKey) { try { diagnosis = sanitizeDiagnosis(await callOpenAI(apiKey, content, history.filter((m) => m.role === "user" || m.role === "assistant").map((m) => ({ role: m.role, content: m.content })), images, audioNames, transcripts), evidenceCount, true); } catch (error) { console.error("AI diagnostic provider failed; using conservative fallback", error); diagnosis = sanitizeDiagnosis(fallbackDiagnosis(content, `${session.vehicleInfo?.year || ""} ${session.vehicleInfo?.make || ""} ${session.vehicleInfo?.model || ""}`), evidenceCount, false); } } else diagnosis = sanitizeDiagnosis(fallbackDiagnosis(content, `${session.vehicleInfo?.year || ""} ${session.vehicleInfo?.make || ""} ${session.vehicleInfo?.model || ""}`), evidenceCount, false);
+  if (apiKey) { try { diagnosis = sanitizeDiagnosis(await callOpenAI(apiKey, content, history.filter((m) => m.role === "user" || m.role === "assistant").map((m) => ({ role: m.role, content: m.content })), images, audioNames, transcripts), true); } catch (error) { console.error("AI diagnostic provider failed; using conservative fallback", error); diagnosis = sanitizeDiagnosis(fallbackDiagnosis(content, `${session.vehicleInfo?.year || ""} ${session.vehicleInfo?.make || ""} ${session.vehicleInfo?.model || ""}`), false); } } else diagnosis = sanitizeDiagnosis(fallbackDiagnosis(content, `${session.vehicleInfo?.year || ""} ${session.vehicleInfo?.make || ""} ${session.vehicleInfo?.model || ""}`), false);
   await ctx.db.insert("diagnosticMessages", { sessionId: args.sessionId, role: "assistant", content: diagnosis.content, evidence: { level: diagnosis.evidence.level, sources: diagnosis.evidence.sources, confidence: diagnosis.evidence.confidence, missingEvidence: diagnosis.evidence.missingEvidence, alternativeExplanations: diagnosis.evidence.alternativeExplanations, nextStep: diagnosis.evidence.nextStep, safetyFlags: diagnosis.evidence.safetyFlags }, createdAt: now + 1 }); await ctx.db.patch(args.sessionId, { updatedAt: now, confidenceSummary: diagnosis.evidence.confidence }); await auditLog(ctx, user._id, "message_send", args.sessionId, { contentLength: content.length, attachmentCount: attachments.length, confidence: diagnosis.evidence.confidence, evidenceLevel: diagnosis.evidence.level }); return { confidence: diagnosis.evidence.confidence };
 }});
 
 export const cleanupRateLimits = internalMutation({ args: {}, handler: async (ctx) => { const cutoff = Math.floor(Date.now() / 1000) - RATE_LIMIT_MAX_AGE_SEC; const rows = await ctx.db.query("rateLimits").collect(); let deleted = 0; for (const row of rows) { const idx = row.window.lastIndexOf(":"); const timestamp = idx >= 0 ? Number(row.window.slice(idx + 1)) : NaN; if (!Number.isFinite(timestamp) || timestamp < cutoff) { await ctx.db.delete(row._id); deleted++; } } return { deleted }; }});
+
+export const cleanupUploadClaims = internalMutation({ args: {}, handler: async (ctx) => { const cutoff = Date.now(); const rows = await ctx.db.query("uploadClaims").collect(); let deleted = 0; for (const row of rows) if (row.expiresAt < cutoff || row.claimedAt) { await ctx.db.delete(row._id); deleted++; } return { deleted }; }});
