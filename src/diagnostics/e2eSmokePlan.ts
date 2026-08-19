@@ -1,0 +1,17 @@
+export const PRODUCTION_SMOKE_PLAN = [
+  "Unauthenticated user cannot access diagnostics",
+  "Authenticated user can create a session",
+  "Authenticated user can upload an allowed image/audio file",
+  "Upload claim cannot be reused or transferred between users",
+  "Vehicle identity can be VIN-decoded through NHTSA",
+  "Recall evidence retrieval returns source and retrieval timestamp",
+  "OBD snapshot validates DTC/freeze-frame/live-data structure",
+  "AI Action rejects requests when user compute budget is exhausted",
+  "AI output with fabricated verified evidence is downgraded",
+  "Brake/HV/fire hazards produce a safety gate",
+  "Cross-user session access is denied",
+  "Account deletion removes diagnostic records",
+  "No client-callable mutation exists",
+  "No anonymous provider or guest UI exists",
+  "Production health/build/security guard all pass",
+] as const;
