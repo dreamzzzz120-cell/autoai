@@ -1,6 +1,6 @@
 import { v } from "convex/values";
 import { action } from "./_generated/server";
-import { internal } from "./_generated/api";
+import { api, internal } from "./_generated/api";
 
 /**
  * Read-only scan-tool boundary.
@@ -44,10 +44,10 @@ export const ingestReadOnlySnapshot = action({
     const user = await ctx.runQuery(internal.users.getCurrentUserInternal, {});
     if (!user) throw new Error("Authentication required");
 
-    const session = await ctx.runQuery(internal.diagnostics.getSessionForUser, {
-      sessionId: args.sessionId,
-    });
-    if (!session) throw new Error("Diagnostic session not found");
+    // Public getSession performs the second ownership check. The action never
+    // trusts a client-supplied session id by itself.
+    const session = await ctx.runQuery(api.diagnostics.getSession, { sessionId: args.sessionId });
+    if (!session || session.userId !== user._id) throw new Error("Diagnostic session not found");
 
     return {
       sessionId: args.sessionId,
