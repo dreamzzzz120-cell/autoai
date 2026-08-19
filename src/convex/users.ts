@@ -1,5 +1,5 @@
 import { getAuthUserId } from "@convex-dev/auth/server";
-import { query, QueryCtx } from "./_generated/server";
+import { internalQuery, query, QueryCtx } from "./_generated/server";
 
 /**
  * AutoAI has no guest mode. Legacy anonymous records are treated as
@@ -16,6 +16,11 @@ export const getCurrentUser = async (ctx: QueryCtx) => {
 };
 
 export const currentUser = query({
+  args: {},
+  handler: async (ctx) => getCurrentUser(ctx),
+});
+
+export const getCurrentUserInternal = internalQuery({
   args: {},
   handler: async (ctx) => getCurrentUser(ctx),
 });
