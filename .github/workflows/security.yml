@@ -1,4 +1,4 @@
-name: Security and build gate
+name: Security, diagnostic benchmark and build gate
 
 on:
   push:
@@ -36,6 +36,9 @@ jobs:
 
       - name: Permanent security guard
         run: npm run security:guard
+
+      - name: Diagnostic benchmark
+        run: npm run diagnostic:benchmark
 
       - name: Dependency audit
         run: npm audit --audit-level=high
