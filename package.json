@@ -5,13 +5,14 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "npm run security:guard && npm run diagnostic:benchmark && npm run diagnostic:adversarial && npm run production:gate && tsc -b && vite build",
+    "build": "npm run security:guard && npm run diagnostic:benchmark && npm run diagnostic:adversarial && npm run shop:benchmark && npm run production:gate && tsc -b && vite build",
     "lint": "eslint .",
     "format": "prettier --write .",
     "preview": "vite preview",
     "security:guard": "node scripts/security-guard.mjs",
     "diagnostic:benchmark": "node scripts/diagnostic-benchmark.mjs",
     "diagnostic:adversarial": "node scripts/diagnostic-adversarial-gate.mjs",
+    "shop:benchmark": "node scripts/shop-security-benchmark.mjs",
     "production:gate": "node scripts/production-readiness-gate.mjs"
   },
   "dependencies": {
