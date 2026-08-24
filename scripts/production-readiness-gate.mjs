@@ -16,6 +16,7 @@ const required = [
   "scripts/security-guard.mjs",
   "scripts/diagnostic-benchmark.mjs",
   "scripts/diagnostic-adversarial-gate.mjs",
+  "scripts/shop-security-benchmark.mjs",
   "tests/diagnostic/vehicle-fixtures.json",
   "tests/diagnostic/adversarial-cases.json",
 ];
