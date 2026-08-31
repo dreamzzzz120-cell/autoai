@@ -17,7 +17,7 @@
     "production:gate": "node scripts/production-readiness-gate.mjs"
   },
   "dependencies": {
-    "@convex-dev/auth": "^0.0.90",
+    "@convex-dev/auth": "^0.0.95",
     "@hookform/resolvers": "^5.2.2",
     "@jridgewell/trace-mapping": "^0.3.31",
     "@oslojs/crypto": "^1.0.1",
